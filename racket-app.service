@@ -1,0 +1,13 @@
+[Unit]
+Description=Racket Procedural Generator App
+After=network.target
+
+[Service]
+Type=simple
+User=micu
+WorkingDirectory=/home/micu/racket_app
+ExecStart=/usr/bin/racket /home/micu/racket_app/app.rkt
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

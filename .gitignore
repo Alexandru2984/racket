@@ -1,0 +1,11 @@
+# Racket
+compiled/
+*.zo
+*.dep
+# editor / os
+*.swp
+*~
+.DS_Store
+# local artifacts
+*.log
+uploads/
