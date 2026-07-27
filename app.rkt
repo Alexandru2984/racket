@@ -4,6 +4,7 @@
          web-server/http/bindings
          net/url
          racket/draw
+         racket/math
          xml)
 
 ;; ---------------------------------------------------------------------------
@@ -46,23 +47,51 @@
       (number->string (inexact->exact f))
       (~r f #:precision 3)))
 
-;; Safe numeric evaluator for the little arithmetic sub-language.  Bounded in
-;; both recursion depth and value magnitude; unknown forms evaluate to 0.
-(define (eval-num v [depth 0])
+;; Real-valued modulo that also works on flonums (SVG art wants tiling).
+(define (safe-mod a b)
+  (if (zero? b) 0 (- a (* b (floor (/ a b))))))
+
+;; Base environment: named constants available to every expression.  `i` is
+;; injected by `repeat` as the loop index; `let` extends this with locals.
+(define BASE-ENV (hasheq 'pi pi 'tau (* 2 pi) 'width 600 'height 400))
+
+;; Safe numeric evaluator for the arithmetic sub-language.  Bounded in both
+;; recursion depth and value magnitude; symbols resolve against `env`; every
+;; unknown form evaluates to 0 rather than raising.
+(define (eval-num v env [depth 0])
+  (define (ev x) (eval-num x env (add1 depth)))
   (cond
     [(> depth MAX-EXPR-DEPTH) 0]
     [(number? v) (clamp-num (if (real? v) v 0))]
+    [(symbol? v) (let ([r (hash-ref env v 0)]) (clamp-num (if (real? r) r 0)))]
     [(pair? v)
      (clamp-num
       (match v
         [(list 'random n)
-         (let ([m (inexact->exact (floor (max 0 (eval-num n (add1 depth)))))])
+         (let ([m (inexact->exact (floor (max 0 (ev n))))])
            (if (<= m 0) 0 (random (min m MAX-RANDOM))))]
-        [(list '+ a b) (+ (eval-num a (add1 depth)) (eval-num b (add1 depth)))]
-        [(list '- a b) (- (eval-num a (add1 depth)) (eval-num b (add1 depth)))]
-        [(list '* a b) (* (eval-num a (add1 depth)) (eval-num b (add1 depth)))]
-        [(list '/ a b) (let ([d (eval-num b (add1 depth))])
-                         (if (zero? d) 0 (/ (eval-num a (add1 depth)) d)))]
+        [(list 'random a b)
+         (let ([lo (inexact->exact (floor (ev a)))]
+               [hi (inexact->exact (floor (ev b)))])
+           (if (< lo hi) (+ lo (random (min (- hi lo) MAX-RANDOM))) lo))]
+        [(cons '+ args)              (for/sum     ([x (in-list args)]) (ev x))]
+        [(cons '* args)              (for/product ([x (in-list args)]) (ev x))]
+        [(list '- a)                 (- (ev a))]
+        [(cons '- (cons a rest))     (- (ev a) (for/sum ([x (in-list rest)]) (ev x)))]
+        [(list '/ a b)               (let ([d (ev b)]) (if (zero? d) 0 (/ (ev a) d)))]
+        [(list 'mod a b)             (safe-mod (ev a) (ev b))]
+        [(list 'pow a b)             (let ([base (ev a)] [e (max -8 (min 8 (ev b)))])
+                                       (if (and (<= base 0) (not (integer? e))) 0 (expt base e)))]
+        [(list 'sin a)               (sin (ev a))]
+        [(list 'cos a)               (cos (ev a))]
+        [(list 'tan a)               (let ([c (cos (ev a))]) (if (zero? c) 0 (/ (sin (ev a)) c)))]
+        [(list 'sqrt a)              (let ([x (ev a)]) (if (< x 0) 0 (sqrt x)))]
+        [(list 'abs a)               (abs (ev a))]
+        [(list 'neg a)               (- (ev a))]
+        [(list 'floor a)             (floor (ev a))]
+        [(list 'round a)             (round (ev a))]
+        [(cons 'min (and args (cons _ _))) (apply min (map ev args))]
+        [(cons 'max (and args (cons _ _))) (apply max (map ev args))]
         [_ 0]))]
     [else 0]))
 
@@ -74,9 +103,25 @@
 (define color-rx
   #px"^(#[0-9a-fA-F]{3,8}|rgba?\\([-0-9.,%[:space:]]+\\)|hsla?\\([-0-9.,%[:space:]]+\\)|[a-zA-Z]{1,20})$")
 
-(define (eval-color c [fallback "#ff79c6"])
-  (define s (and (string? c) (string-trim c)))
-  (if (and s (<= (string-length s) 40) (regexp-match? color-rx s)) s fallback))
+(define (clamp-255 x)  (max 0   (min 255 (inexact->exact (round x)))))
+(define (clamp-pct x)  (max 0   (min 100 (inexact->exact (round x)))))
+(define (clamp-360 x)  (modulo (inexact->exact (round x)) 360))
+(define (clamp-unit x) (~r (max 0.0 (min 1.0 (exact->inexact x))) #:precision 3))
+
+;; Colors may be a literal string (validated against the whitelist) or a
+;; computed builder — (rgb r g b), (rgba r g b a), (hsl h s l), (hsla h s l a) —
+;; whose numeric parts are evaluated and hard-clamped to valid CSS ranges.
+(define (eval-color c env [fallback "#ff79c6"])
+  (define (ev x) (eval-num x env))
+  (match c
+    [(? string?)
+     (define s (string-trim c))
+     (if (and (<= (string-length s) 40) (regexp-match? color-rx s)) s fallback)]
+    [(list 'rgb r g b)      (format "rgb(~a,~a,~a)"        (clamp-255 (ev r)) (clamp-255 (ev g)) (clamp-255 (ev b)))]
+    [(list 'rgba r g b a)   (format "rgba(~a,~a,~a,~a)"    (clamp-255 (ev r)) (clamp-255 (ev g)) (clamp-255 (ev b)) (clamp-unit (ev a)))]
+    [(list 'hsl h s l)      (format "hsl(~a,~a%,~a%)"      (clamp-360 (ev h)) (clamp-pct (ev s)) (clamp-pct (ev l)))]
+    [(list 'hsla h s l a)   (format "hsla(~a,~a%,~a%,~a)"  (clamp-360 (ev h)) (clamp-pct (ev s)) (clamp-pct (ev l)) (clamp-unit (ev a)))]
+    [_ fallback]))
 
 ;; ---------------------------------------------------------------------------
 ;; Render context: a shared, mutable budget so total emitted nodes are capped
@@ -96,37 +141,94 @@
                 (font-family "monospace") (font-size "13"))
                ,(string-append label ": " (short-str msg)))))
 
-;; Interpret one command into a list of SVG xexprs.  `depth` bounds nesting;
-;; the context bounds total output.  Every path is guarded so malformed or
-;; hostile input degrades to a small error node instead of an exception/hang.
-(define (interpret cmd ctx depth)
+;; Cap text length so a single (text ...) node can't carry a megabyte of glyphs.
+(define MAX-TEXT-LEN 300)
+(define (clip-text s)
+  (if (> (string-length s) MAX-TEXT-LEN) (substring s 0 MAX-TEXT-LEN) s))
+
+;; Turn a flat list of coordinate expressions into an SVG "x,y x,y ..." string.
+;; Points are capped so a giant coordinate list can't bloat one element.
+(define MAX-POINTS 600)
+(define (points->str exprs env)
+  (define nums (for/list ([e (in-list exprs)] [_ (in-range (* 2 MAX-POINTS))])
+                 (eval-num e env)))
+  (let loop ([xs nums] [acc '()])
+    (cond
+      [(or (null? xs) (null? (cdr xs))) (string-join (reverse acc) " ")]
+      [else (loop (cddr xs) (cons (format "~a,~a" (fmt-num (car xs)) (fmt-num (cadr xs))) acc))])))
+
+;; Build a star / n-gon burst as a <polygon>.  Spike count is clamped.
+(define (star-xexpr cx cy spikes outer inner fill)
+  (define n (max 2 (min 100 (inexact->exact (floor spikes)))))
+  (define pts
+    (for/list ([k (in-range (* 2 n))])
+      (define r (if (even? k) outer inner))
+      (define ang (- (* k (/ pi n)) (/ pi 2)))
+      (format "~a,~a" (fmt-num (+ cx (* r (cos ang)))) (fmt-num (+ cy (* r (sin ang)))))))
+  `(polygon ((points ,(string-join pts " ")) (fill ,fill)) ""))
+
+;; Interpret one command into a list of SVG xexprs.  `env` carries constants /
+;; the loop index / locals, `depth` bounds nesting, `ctx` bounds total output.
+;; Every path is guarded so malformed or hostile input degrades to a small
+;; error node instead of an exception/hang.
+(define (interpret cmd env ctx depth)
   (cond
     [(not (budget-left? ctx)) '()]
     [(> depth MAX-DEPTH) '()]
     [else
      (with-handlers ([exn:fail? (lambda (e) (err-node "Eroare interpretare" (exn-message e) 24))])
+       (define (n v) (fmt-num (eval-num v env)))
+       (define (col c) (eval-color c env))
        (match cmd
          [(list 'circle cx cy r c)
           (spend! ctx)
-          (list `(circle ((cx ,(fmt-num (eval-num cx))) (cy ,(fmt-num (eval-num cy)))
-                          (r ,(fmt-num (eval-num r))) (fill ,(eval-color c))) ""))]
+          (list `(circle ((cx ,(n cx)) (cy ,(n cy)) (r ,(n r)) (fill ,(col c))) ""))]
          [(list 'rect x y w h c)
           (spend! ctx)
-          (list `(rect ((x ,(fmt-num (eval-num x))) (y ,(fmt-num (eval-num y)))
-                        (width ,(fmt-num (eval-num w))) (height ,(fmt-num (eval-num h)))
-                        (fill ,(eval-color c))) ""))]
+          (list `(rect ((x ,(n x)) (y ,(n y)) (width ,(n w)) (height ,(n h)) (fill ,(col c))) ""))]
+         [(list 'ellipse cx cy rx ry c)
+          (spend! ctx)
+          (list `(ellipse ((cx ,(n cx)) (cy ,(n cy)) (rx ,(n rx)) (ry ,(n ry)) (fill ,(col c))) ""))]
          [(list 'line x1 y1 x2 y2 c w)
           (spend! ctx)
-          (list `(line ((x1 ,(fmt-num (eval-num x1))) (y1 ,(fmt-num (eval-num y1)))
-                        (x2 ,(fmt-num (eval-num x2))) (y2 ,(fmt-num (eval-num y2)))
-                        (stroke ,(eval-color c)) (stroke-width ,(fmt-num (eval-num w)))) ""))]
-         [(list 'repeat n cmds ...)
+          (list `(line ((x1 ,(n x1)) (y1 ,(n y1)) (x2 ,(n x2)) (y2 ,(n y2))
+                        (stroke ,(col c)) (stroke-width ,(n w))) ""))]
+         [(list 'text x y size c (? string? s))
           (spend! ctx)
-          (define reps (min MAX-REPEAT (max 0 (inexact->exact (floor (eval-num n))))))
+          (list `(text ((x ,(n x)) (y ,(n y)) (font-size ,(n size))
+                        (font-family "system-ui, sans-serif") (fill ,(col c)))
+                       ,(clip-text s)))]
+         [(list 'bg c)
+          (spend! ctx)
+          (list `(rect ((x "0") (y "0") (width "600") (height "400") (fill ,(col c))) ""))]
+         [(list 'polygon c pts ...)
+          (spend! ctx)
+          (list `(polygon ((points ,(points->str pts env)) (fill ,(col c))) ""))]
+         [(list 'polyline c w pts ...)
+          (spend! ctx)
+          (list `(polyline ((points ,(points->str pts env)) (fill "none")
+                            (stroke ,(col c)) (stroke-width ,(n w))) ""))]
+         [(list 'star cx cy spikes outer inner c)
+          (spend! ctx)
+          (list (star-xexpr (eval-num cx env) (eval-num cy env) (eval-num spikes env)
+                            (eval-num outer env) (eval-num inner env) (col c)))]
+         [(cons 'let (cons bindings body))
+          (define env*
+            (if (list? bindings)
+                (for/fold ([e env]) ([bnd (in-list bindings)])
+                  (match bnd
+                    [(list (? symbol? name) vexpr) (hash-set e name (eval-num vexpr env))]
+                    [_ e]))
+                env))
+          (apply append (for/list ([b (in-list body)]) (interpret b env* ctx (add1 depth))))]
+         [(list 'repeat count body ...)
+          (spend! ctx)
+          (define reps (min MAX-REPEAT (max 0 (inexact->exact (floor (eval-num count env))))))
           (apply append
-                 (for/list ([_ (in-range reps)] #:break (not (budget-left? ctx)))
+                 (for/list ([i (in-range reps)] #:break (not (budget-left? ctx)))
+                   (define env* (hash-set env 'i i))
                    (apply append
-                          (for/list ([c (in-list cmds)]) (interpret c ctx (add1 depth))))))]
+                          (for/list ([b (in-list body)]) (interpret b env* ctx (add1 depth))))))]
          [_ (err-node "Comanda invalida" (short-str cmd) 40)]))]))
 
 ;; ---------------------------------------------------------------------------
@@ -158,7 +260,7 @@
     (if (list? forms)
         (apply append
                (for/list ([c (in-list forms)] #:break (not (budget-left? ctx)))
-                 (interpret c ctx 0)))
+                 (interpret c BASE-ENV ctx 0)))
         '()))
   (define notice
     (if (<= (rctx-budget ctx) 0)
@@ -222,11 +324,16 @@
 
 (define DEFAULT-CODE
   (string-append
-   ";; Magie cu bucle (repeat) si functii (random)\n"
-   "(repeat 80\n"
-   "  (circle (random 600) (random 400) (random 40) \"rgba(255, 121, 198, 0.5)\"))\n\n"
-   ";; Un patrat cu matematica simpla\n"
-   "(rect (+ 100 100) (/ 400 2) 200 50 \"#8be9fd\")"))
+   ";; Foloseste (i) = indexul buclei, trigonometrie si culori hsl calculate.\n"
+   "(bg \"#0b0f1a\")\n\n"
+   ";; Un vartej de cercuri colorate\n"
+   "(repeat 90\n"
+   "  (circle (+ 300 (* (* i 2.2) (cos (* i 0.35))))\n"
+   "          (+ 200 (* (* i 2.2) (sin (* i 0.35))))\n"
+   "          6\n"
+   "          (hsl (* i 5) 85 60)))\n\n"
+   ";; O stea in centru\n"
+   "(star 300 200 5 40 16 \"#f1fa8c\")"))
 
 (define (start req)
   ;; The web-server body parser throws on malformed / non-UTF-8 form bodies;
