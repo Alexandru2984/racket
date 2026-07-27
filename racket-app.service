@@ -6,8 +6,46 @@ After=network.target
 Type=simple
 User=micu
 WorkingDirectory=/home/micu/racket_app
+Environment=RACKET_APP_PORT=8345
 ExecStart=/usr/bin/racket /home/micu/racket_app/app.rkt
 Restart=always
+RestartSec=2
+
+# --- Resource limits ---------------------------------------------------------
+# The DSL is public and unauthenticated. The in-app budgets already bound a
+# single render, and these caps are the second line of defense: a runaway or
+# exploited process is confined instead of taking the whole VPS down.
+MemoryHigh=384M
+MemoryMax=512M
+CPUQuota=75%
+TasksMax=64
+LimitNOFILE=4096
+
+# --- Sandboxing / privilege reduction ---------------------------------------
+# Conservative but effective. If the unit ever fails to start after a change,
+# the usual suspects to relax first are SystemCallFilter and ProtectSystem.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+# The app only reads its own directory; keep exactly that writable (Racket may
+# cache compiled bytecode there) and nothing else.
+ReadWritePaths=/home/micu/racket_app
+ProtectHome=read-only
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
