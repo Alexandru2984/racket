@@ -267,9 +267,14 @@
         (list `(text ((x "12") (y "392") (fill "#ffb86c") (font-family "monospace") (font-size "12"))
                      "… limita de complexitate atinsa (output trunchiat)"))
         '()))
+  ;; viewBox lets the canvas scale to any container width while keeping the
+  ;; 600x400 coordinate system; explicit width/height keep the downloaded file
+  ;; usable standalone.
   `(svg ((xmlns "http://www.w3.org/2000/svg")
+         (viewBox "0 0 600 400")
          (width "600") (height "400")
-         (style "border: 1px solid #444; background: #000; border-radius: 8px;"))
+         (preserveAspectRatio "xMidYMid meet")
+         (style "background:#000;border-radius:12px;display:block;width:100%;height:auto;"))
         ,@elements ,@notice))
 
 ;; ---------------------------------------------------------------------------
@@ -335,6 +340,120 @@
    ";; O stea in centru\n"
    "(star 300 200 5 40 16 \"#f1fa8c\")"))
 
+;; ---------------------------------------------------------------------------
+;; UI: mobile-first responsive page.  The app is server-rendered and fully
+;; usable without JavaScript (examples are plain POST forms); JS only adds the
+;; copy-to-clipboard convenience and the chosen-file name.
+;; ---------------------------------------------------------------------------
+(define PAGE-CSS "
+:root{--bg:#0b0d14;--bg2:#0f121b;--panel:#161a26;--panel2:#1b2030;--border:#272d40;
+--border2:#333b52;--text:#e7e9f3;--muted:#9aa3bd;--purple:#bd93f9;--pink:#ff79c6;
+--cyan:#8be9fd;--green:#50fa7b;--yellow:#f1fa8c;--radius:14px}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+body{margin:0;font-family:system-ui,-apple-system,Roboto,Arial,sans-serif;color:var(--text);
+line-height:1.55;min-height:100vh;background:
+radial-gradient(1100px 560px at 82% -12%,#1a1030 0,transparent 60%),
+radial-gradient(950px 480px at -8% 8%,#08202b 0,transparent 55%),var(--bg)}
+a{color:var(--cyan);text-decoration:none}a:hover{text-decoration:underline}
+.wrap{max-width:1200px;margin:0 auto;padding:clamp(1rem,3.5vw,2.25rem)}
+.hero{text-align:center;margin-bottom:1.4rem}
+.hero h1{font-size:clamp(1.6rem,5vw,2.5rem);margin:.25rem 0;font-weight:800;
+background:linear-gradient(90deg,var(--purple),var(--pink),var(--cyan));
+-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero p{color:var(--muted);margin:.25rem auto 0;max-width:46ch;font-size:clamp(.92rem,2.5vw,1.05rem)}
+.badge{display:inline-block;font-size:.7rem;letter-spacing:.09em;text-transform:uppercase;
+color:var(--purple);border:1px solid var(--border2);border-radius:999px;padding:.2rem .7rem;margin-bottom:.5rem}
+.grid{display:grid;gap:1.15rem;grid-template-columns:1fr}
+@media(min-width:920px){.grid{grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:start}}
+.panel{background:linear-gradient(180deg,var(--panel),var(--bg2));border:1px solid var(--border);
+border-radius:var(--radius);padding:clamp(.9rem,2.5vw,1.25rem);box-shadow:0 12px 30px rgba(0,0,0,.35)}
+.panel h2{font-size:.82rem;margin:0 0 .7rem;color:var(--muted);text-transform:uppercase;letter-spacing:.07em}
+textarea{width:100%;min-height:340px;resize:vertical;background:#0b0e17;color:#f5f6ff;
+border:1px solid var(--border);border-radius:10px;padding:1rem;tab-size:2;
+font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+textarea:focus,input:focus,button:focus-visible,.btn:focus-visible{outline:2px solid var(--purple);outline-offset:2px}
+.toolbar{display:flex;flex-wrap:wrap;gap:.55rem;margin-top:.8rem}
+button,.btn{font:600 15px/1 system-ui,sans-serif;cursor:pointer;border:none;border-radius:10px;
+padding:.75rem 1.1rem;color:#12131a;background:var(--purple);display:inline-flex;align-items:center;
+gap:.4rem;transition:filter .15s,transform .05s}
+button:hover,.btn:hover{filter:brightness(1.08);text-decoration:none}
+button:active,.btn:active{transform:translateY(1px)}
+.btn-ghost{background:transparent;color:var(--text);border:1px solid var(--border2)}
+.btn-cyan{background:var(--cyan)}.btn-pink{background:var(--pink)}
+.stage{background:#000;border:1px solid var(--border);border-radius:var(--radius);padding:.55rem;overflow:hidden}
+.stage svg{width:100%;height:auto;display:block}
+.hint{color:var(--muted);font-size:.85rem;margin:.55rem 0 0}
+.examples{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:.6rem}
+.ex-form{margin:0;display:block}
+.ex{width:100%;padding:.7rem .8rem;text-align:left;background:var(--panel2);border:1px solid var(--border);
+border-radius:10px;color:var(--text);font-weight:700;font-size:.9rem;flex-direction:column;align-items:flex-start}
+.ex:hover{border-color:var(--purple);color:var(--purple);filter:none}
+.ex small{display:block;color:var(--muted);font-weight:400;font-size:.72rem;margin-top:.15rem}
+.file-row{display:flex;flex-wrap:wrap;gap:.6rem;align-items:center}
+input[type=file]{color:var(--muted);font-size:.9rem;max-width:100%}
+input[type=file]::file-selector-button{font:600 14px system-ui;margin-right:.6rem;padding:.6rem .9rem;
+border:none;border-radius:8px;background:var(--cyan);color:#0b0e17;cursor:pointer}
+details.cheat{margin-top:1.15rem;background:var(--panel);border:1px solid var(--border);
+border-radius:var(--radius);padding:.6rem 1.1rem}
+details.cheat>summary{cursor:pointer;font-weight:700;color:var(--text);padding:.5rem 0}
+.cheat-grid{display:grid;gap:1rem;grid-template-columns:1fr;margin-top:.5rem}
+@media(min-width:640px){.cheat-grid{grid-template-columns:1fr 1fr}}
+@media(min-width:1000px){.cheat-grid{grid-template-columns:repeat(4,1fr)}}
+.cheat-grid h3{color:var(--cyan);font-size:.78rem;text-transform:uppercase;letter-spacing:.05em;margin:.1rem 0 .5rem}
+.cheat-grid ul{list-style:none;margin:0;padding:0}.cheat-grid li{margin:.35rem 0}
+code{background:#0b0e17;border:1px solid var(--border);padding:.14rem .42rem;border-radius:6px;
+font:12.5px ui-monospace,Menlo,monospace;color:var(--green);white-space:nowrap}
+footer{text-align:center;color:var(--muted);font-size:.85rem;margin-top:2rem;padding-top:1rem;border-top:1px solid var(--border)}
+.toast{position:fixed;left:50%;bottom:1.2rem;transform:translateX(-50%) translateY(150%);background:var(--panel2);
+border:1px solid var(--border2);color:var(--text);padding:.7rem 1.1rem;border-radius:10px;
+box-shadow:0 10px 30px rgba(0,0,0,.4);transition:transform .25s;z-index:50}
+.toast.show{transform:translateX(-50%) translateY(0)}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+")
+
+;; Kept free of & < > so it survives xexpr's pcdata escaping unchanged.
+(define PAGE-JS "
+(function(){
+  var ta=document.getElementById('code');
+  function toast(m){var t=document.getElementById('toast');if(!t){return;}
+    t.textContent=m;t.classList.add('show');clearTimeout(window.__tt);
+    window.__tt=setTimeout(function(){t.classList.remove('show');},1800);}
+  function fallback(){if(!ta){return;}ta.focus();ta.select();try{document.execCommand('copy');}catch(e){}toast('Cod copiat');}
+  function copyCode(){if(!ta){return;}
+    if(navigator.clipboard){navigator.clipboard.writeText(ta.value).then(function(){toast('Cod copiat');},fallback);}
+    else{fallback();}}
+  var b=document.getElementById('btnCopy');if(b){b.addEventListener('click',copyCode);}
+  var f=document.getElementById('image_file');
+  if(f){f.addEventListener('change',function(){var n=document.getElementById('fname');
+    if(n){n.textContent=f.files[0]?f.files[0].name:'';}});}
+})();
+")
+
+;; Preset programs — each is a plain POST form, so they work without JS.
+(define EXAMPLES
+  (list
+   (list "Vartej" "spirala trig" DEFAULT-CODE)
+   (list "Curcubeu" "benzi hsl"
+         "(repeat 24 (rect (* i 25) 0 26 400 (hsl (* i 15) 80 55)))")
+   (list "Cer instelat" "random + luna"
+         "(bg \"#05070f\")\n(repeat 160 (circle (random 600) (random 400) (random 1 3) \"#ffffff\"))\n(circle 480 90 42 \"#f1fa8c\")")
+   (list "Floare" "roza polara"
+         "(bg \"#0b0f1a\")\n(repeat 140\n  (let ([a (* i 0.2)] [r (* 160 (cos (* 5 (* i 0.2))))])\n    (circle (+ 300 (* r (cos a))) (+ 200 (* r (sin a))) 5 (hsl (* i 3) 90 62))))")
+   (list "Grila" "repeat imbricat"
+         "(bg \"#0e1017\")\n(repeat 10\n  (let ([col i])\n    (repeat 7\n      (star (+ 40 (* col 58)) (+ 40 (* i 55)) 5 18 8 (hsl (* (+ (* col 7) i) 8) 78 62)))))")
+   (list "Unda" "sinusoida"
+         "(bg \"#0b0f1a\")\n(repeat 60\n  (circle (* i 10) (+ 200 (* 120 (sin (* i 0.3)))) 6 (hsl (* i 6) 85 60)))")))
+
+(define (example-card title desc code)
+  `(form ((method "post") (class "ex-form"))
+     (input ((type "hidden") (name "action") (value "preview")))
+     (input ((type "hidden") (name "code") (value ,code)))
+     (button ((type "submit") (class "ex")) ,title (small ,desc))))
+
+(define (cheat-col heading items)
+  `(div (h3 ,heading)
+        (ul ,@(for/list ([it (in-list items)]) `(li (code ,it))))))
+
 (define (start req)
   ;; The web-server body parser throws on malformed / non-UTF-8 form bodies;
   ;; swallow that so a hostile request degrades to empty bindings, not a 500.
@@ -384,30 +503,78 @@
 
        [else
         (response/xexpr
-         `(html
-           (head (title "Procedural DSL Art")
-                 (meta ((name "viewport") (content "width=device-width, initial-scale=1.0")))
-                 (style "body { font-family: system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; padding: 2rem; background: #111; color: #eee; } textarea { background: #222; color: #ff79c6; border: 1px solid #444; padding: 1rem; width: 600px; height: 300px; font-size: 16px; font-family: monospace; border-radius: 4px; margin-bottom: 1rem; } button { padding: 0.8rem 1.5rem; font-size: 16px; cursor: pointer; background: #bd93f9; color: #282a36; font-weight: bold; border: none; border-radius: 4px; margin: 0.5rem; } button:hover { background: #ff79c6; } svg { margin-top: 1rem; box-shadow: 0 10px 30px rgba(0,0,0,0.5); } .container { max-width: 800px; text-align: center; } p { color: #8be9fd; } code { background: #282a36; padding: 2px 6px; border-radius: 4px; } .panel { background: #222; padding: 1rem; border-radius: 8px; margin-bottom: 1rem; border: 1px solid #444; }"))
+         #:preamble #"<!DOCTYPE html>"
+         `(html ((lang "ro"))
+           (head
+            (meta ((charset "utf-8")))
+            (title "Procedural Canvas DSL — Racket")
+            (meta ((name "viewport") (content "width=device-width, initial-scale=1")))
+            (meta ((name "color-scheme") (content "dark")))
+            (meta ((name "description")
+                   (content "Un mic limbaj Lisp-like scris in Racket care randeaza arta SVG: bucle, trigonometrie, culori si forme procedurale.")))
+            (link ((rel "icon")
+                   (href "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0d14'/%3E%3Ccircle cx='16' cy='16' r='9' fill='%23bd93f9'/%3E%3C/svg%3E")))
+            (style ,PAGE-CSS))
            (body
-            (div ((class "container"))
-             (h1 "Procedural Canvas DSL (Racket)")
+            (div ((class "wrap"))
+             (header ((class "hero"))
+              (div ((class "badge")) "Racket · web-server · SVG")
+              (h1 "Procedural Canvas DSL")
+              (p "Scrie cod, obtii arta. Bucle, trigonometrie, culori si forme — totul randat pe server, apoi descarcabil ca SVG."))
 
-             (div ((class "panel"))
-              (p (strong "Nou!") " Acum poti folosi bucle si functii.")
-              (p (code "(repeat N comenzi...)") " " (code "(random MAX)") " " (code "(+ a b)"))
-              (p "Incarca o imagine (JPG/PNG) pentru a genera codul ei in DSL:")
-              (form ((method "POST") (enctype "multipart/form-data"))
-                    (input ((type "hidden") (name "action") (value "upload")))
-                    (input ((type "file") (name "image_file") (accept "image/png, image/jpeg")))
-                    (button ((type "submit")) "Converteste Imagine in Cod")))
+             (div ((class "grid"))
+              (section ((class "panel"))
+               (h2 "Editor")
+               (form ((method "post"))
+                (textarea ((id "code") (name "code") (spellcheck "false")
+                           (autocomplete "off") (autocapitalize "off") (autocorrect "off")
+                           (placeholder "Codul tau aici...")) ,final-code)
+                (div ((class "toolbar"))
+                 (button ((type "submit") (name "action") (value "preview")) "▶ Randeaza")
+                 (button ((type "submit") (name "action") (value "download") (class "btn-cyan")) "⭳ Download SVG")
+                 (button ((type "button") (id "btnCopy") (class "btn-ghost")) "⧉ Copiaza")
+                 (a ((href "/") (class "btn btn-ghost")) "↺ Reset")))
+               (p ((class "hint")) "Sfat: in (repeat N ...) variabila (i) e indexul iteratiei. Referinta completa mai jos."))
 
-             (form ((method "POST"))
-                   (textarea ((name "code") (placeholder "Codul tau aici...")) ,final-code)
-                   (br)
-                   (button ((type "submit") (name "action") (value "preview")) "Pre-vizualizare")
-                   (button ((type "submit") (name "action") (value "download")) "Download SVG"))
+              (section ((class "panel"))
+               (h2 "Panza (600 × 400)")
+               (div ((class "stage")) ,(parse-to-svg final-code))
+               (h2 ((style "margin-top:1.15rem")) "Imagine → cod DSL")
+               (form ((method "post") (enctype "multipart/form-data") (class "file-row"))
+                (input ((type "hidden") (name "action") (value "upload")))
+                (input ((type "file") (id "image_file") (name "image_file") (accept "image/png,image/jpeg")))
+                (span ((id "fname") (class "hint")) "")
+                (button ((type "submit") (class "btn-pink")) "Converteste"))
+               (p ((class "hint")) "JPG/PNG, max 3 MB. Imaginea devine cerculete DSL pe care le poti edita.")))
 
-             ,(parse-to-svg final-code)))))])]))
+             (section ((class "panel") (style "margin-top:1.15rem"))
+              (h2 "Exemple — apasa pentru a incarca")
+              (div ((class "examples")) ,@(map (lambda (e) (apply example-card e)) EXAMPLES)))
+
+             (details ((class "cheat") (open "open"))
+              (summary "Referinta limbaj (cheatsheet)")
+              (div ((class "cheat-grid"))
+               ,(cheat-col "Forme"
+                  (list "(circle x y r culoare)" "(rect x y w h culoare)"
+                        "(ellipse cx cy rx ry culoare)" "(line x1 y1 x2 y2 culoare gros)"
+                        "(polygon culoare x1 y1 ...)" "(polyline culoare gros x1 y1 ...)"
+                        "(star cx cy varfuri rext rint culoare)"
+                        "(text x y marime culoare STR)" "(bg culoare)"))
+               ,(cheat-col "Control"
+                  (list "(repeat N cmd...)" "i = index in repeat"
+                        "(let ([nume val] ...) cmd...)"))
+               ,(cheat-col "Numere"
+                  (list "+  -  *  /  mod  pow" "sin cos tan sqrt" "abs neg floor round"
+                        "min max" "(random max)" "(random lo hi)" "pi tau width height"))
+               ,(cheat-col "Culori"
+                  (list "#rrggbb" "nume-css (red...)" "(rgb r g b)" "(rgba r g b a)"
+                        "(hsl h s l)" "(hsla h s l a)"))))
+
+             (footer
+              (p "Procedural Canvas DSL · scris in Racket cu web-server · "
+                 (a ((href "https://github.com/Alexandru2984/racket") (target "_blank") (rel "noopener")) "cod sursa"))))
+            (div ((id "toast") (class "toast")) "")
+            (script ,PAGE-JS))))])]))
 
 (serve/servlet start
                #:port PORT
