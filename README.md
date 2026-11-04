@@ -30,6 +30,8 @@ variable `i` is the current iteration index.
 | `(ring cx cy r color width)` | stroked circle (no fill) |
 | `(arc cx cy r a0 a1 color width)` | stroked circular arc (degrees) |
 | `(triangle x1 y1 x2 y2 x3 y3 color)` | filled triangle |
+| `(poly cx cy sides r color)` | filled regular n-gon |
+| `(heart cx cy size color)` | filled heart |
 | `(polygon color x1 y1 x2 y2 ...)` | filled polygon |
 | `(polyline color width x1 y1 ...)` | open stroked path |
 | `(star cx cy spikes r-outer r-inner color)` | star / n-gon burst |
@@ -40,6 +42,8 @@ variable `i` is the current iteration index.
 | Command | Meaning |
 | --- | --- |
 | `(repeat N cmd ...)` | run the body `N` times; `i` = index |
+| `(for name start end [step] cmd ...)` | ranged loop binding `name` (step optional) |
+| `(grid cols rows cmd ...)` | nested loop exposing `gx` (col), `gy` (row), `gi` (flat) |
 | `(let ([name expr] ...) cmd ...)` | bind computed locals |
 | `(seed N)` | seed `(random ...)` for reproducible art |
 
@@ -78,6 +82,7 @@ Constants: `pi  tau  width  height`.
 
 | Builder | Meaning |
 | --- | --- |
+| `(hsv h s v)` | HSV color (hue 0–360, sat/value 0–100) |
 | `(mix c1 c2 t)` | blend any two colors in RGB at `t` in `[0,1]` |
 | `(linear-bg deg c1 c2 ...)` | fill the canvas with a linear gradient |
 | `(radial-bg c1 c2 ...)` | fill the canvas with a radial gradient |
@@ -107,6 +112,8 @@ Constants: `pi  tau  width  height`.
 - **Surprise** — five seeded generators (flow field, vortex, kaleidoscope,
   polar rose, pulsing rings) produce new art in one click.
 - **Image → DSL** — upload a JPG/PNG and get editable DSL circles back.
+- **Light / dark theme** — 🌓 toggle, persisted in `localStorage` and applied
+  before first paint (the editor and canvas stay dark by design).
 - **No-JavaScript fallback** — every action is also a plain POST form or link,
   so the page works with scripting disabled.
 
