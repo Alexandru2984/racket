@@ -179,6 +179,8 @@
     [(list 'rgba r g b a)   (format "rgba(~a,~a,~a,~a)"    (clamp-255 (ev r)) (clamp-255 (ev g)) (clamp-255 (ev b)) (clamp-unit (ev a)))]
     [(list 'hsl h s l)      (format "hsl(~a,~a%,~a%)"      (clamp-360 (ev h)) (clamp-pct (ev s)) (clamp-pct (ev l)))]
     [(list 'hsla h s l a)   (format "hsla(~a,~a%,~a%,~a)"  (clamp-360 (ev h)) (clamp-pct (ev s)) (clamp-pct (ev l)) (clamp-unit (ev a)))]
+    ;; (hsv h s v): hue 0..360, saturation/value 0..100 — handy for vivid art.
+    [(list 'hsv h s v)      (match-define (list r g b) (hsv->rgb (ev h) (ev s) (ev v))) (format "rgb(~a,~a,~a)" r g b)]
     ;; (mix c1 c2 t): linear RGB interpolation between any two colors at t in
     ;; [0,1] — smooth gradients across a loop without SVG <defs>.
     [(list 'mix c1 c2 t)    (match-define (list r g b) (mix-rgb c1 c2 (ev t) env)) (format "rgb(~a,~a,~a)" r g b)]
@@ -220,6 +222,19 @@
                     (clamp-255 (* 255 (hue->c p q hh)))
                     (clamp-255 (* 255 (hue->c p q (- hh (/ 1.0 3))))))]))
 
+(define (hsv->rgb h s v)
+  (define hh (/ (modulo (inexact->exact (round h)) 360) 60.0))
+  (define ss (/ (max 0.0 (min 100.0 (exact->inexact s))) 100.0))
+  (define vv (/ (max 0.0 (min 100.0 (exact->inexact v))) 100.0))
+  (define c (* vv ss))
+  (define x (* c (- 1 (abs (- (- hh (* 2 (floor (/ hh 2)))) 1)))))
+  (define m (- vv c))
+  (define-values (r1 g1 b1)
+    (cond [(< hh 1) (values c x 0)] [(< hh 2) (values x c 0)]
+          [(< hh 3) (values 0 c x)] [(< hh 4) (values 0 x c)]
+          [(< hh 5) (values x 0 c)] [else (values c 0 x)]))
+  (list (clamp-255 (* 255 (+ r1 m))) (clamp-255 (* 255 (+ g1 m))) (clamp-255 (* 255 (+ b1 m)))))
+
 (define (color->rgb c env)
   (define (ev x) (eval-num x env))
   (match c
@@ -227,6 +242,7 @@
     [(list 'rgba r g b _)  (list (clamp-255 (ev r)) (clamp-255 (ev g)) (clamp-255 (ev b)))]
     [(list 'hsl h s l)     (hsl->rgb (ev h) (ev s) (ev l))]
     [(list 'hsla h s l _)  (hsl->rgb (ev h) (ev s) (ev l))]
+    [(list 'hsv h s v)     (hsv->rgb (ev h) (ev s) (ev v))]
     [(list 'mix c1 c2 t)   (mix-rgb c1 c2 (ev t) env)]
     [(? string?) (let ([s (string-downcase (string-trim c))])
                    (cond [(regexp-match? #px"^#[0-9a-fA-F]{3,8}$" s) (hex->rgb s)]
@@ -335,6 +351,26 @@
       (format "~a,~a" (fmt-num (+ cx (* r (cos ang)))) (fmt-num (+ cy (* r (sin ang)))))))
   `(polygon ((points ,(string-join pts " ")) (fill ,fill)) ""))
 
+;; Regular n-gon (filled) centered at (cx,cy), first vertex pointing up.
+(define (poly-xexpr cx cy sides r fill)
+  (define n (max 3 (min 100 (inexact->exact (floor sides)))))
+  (define pts
+    (for/list ([k (in-range n)] #:break (not (take-point!)))
+      (define ang (- (* k (/ (* 2 pi) n)) (/ pi 2)))
+      (format "~a,~a" (fmt-num (+ cx (* r (cos ang)))) (fmt-num (+ cy (* r (sin ang)))))))
+  `(polygon ((points ,(string-join pts " ")) (fill ,fill)) ""))
+
+;; Parametric heart curve as a filled polygon, centered at (cx,cy).
+(define (heart-xexpr cx cy size fill)
+  (define s (/ size 17.0))
+  (define pts
+    (for/list ([k (in-range 0 360 6)] #:break (not (take-point!)))
+      (define t (degrees->radians k))
+      (define hx (* 16 (expt (sin t) 3)))
+      (define hy (- (+ (* 13 (cos t)) (* -5 (cos (* 2 t))) (* -2 (cos (* 3 t))) (- (cos (* 4 t))))))
+      (format "~a,~a" (fmt-num (+ cx (* s hx))) (fmt-num (+ cy (* s hy))))))
+  `(polygon ((points ,(string-join pts " ")) (fill ,fill)) ""))
+
 ;; Stroked circular arc from angle a0 to a1 (degrees) as an SVG <path>.
 (define (arc-xexpr cx cy r a0 a1 stroke width)
   (define rr (abs r))
@@ -426,6 +462,13 @@
          [(list 'triangle x1 y1 x2 y2 x3 y3 c)
           (spend! ctx)
           (list `(polygon ((points ,(points->str (list x1 y1 x2 y2 x3 y3) env)) (fill ,(col c))) ""))]
+         [(list 'poly cx cy sides r c)
+          (spend! ctx)
+          (list (poly-xexpr (eval-num cx env) (eval-num cy env) (eval-num sides env)
+                            (eval-num r env) (col c)))]
+         [(list 'heart cx cy size c)
+          (spend! ctx)
+          (list (heart-xexpr (eval-num cx env) (eval-num cy env) (eval-num size env) (col c)))]
          [(list 'ring cx cy r c w)
           (spend! ctx)
           (list `(circle ((cx ,(n cx)) (cy ,(n cy)) (r ,(n r)) (fill "none")
@@ -498,6 +541,35 @@
                    (define env* (hash-set env 'i i))
                    (apply append
                           (for/list ([b (in-list body)]) (interpret b env* ctx (add1 depth))))))]
+         ;; (for name start end [step] body...): bind `name` across a range.
+         ;; A numeric literal right after `end` is the step; otherwise step is
+         ;; +1/-1 toward `end`.  Total iterations are bounded like `repeat`.
+         [(list* 'for (? symbol? name) start-e end-e more)
+          (spend! ctx)
+          (define a (eval-num start-e env)) (define b (eval-num end-e env))
+          (define step-given (and (pair? more) (number? (car more))))
+          (define body (if step-given (cdr more) more))
+          (define raw (if step-given (car more) (if (<= a b) 1 -1)))
+          (define st (if (zero? raw) (if (<= a b) 1 -1) raw))
+          (define cnt (min MAX-REPEAT (max 0 (add1 (inexact->exact (floor (/ (abs (- b a)) (max 1e-6 (abs st)))))))))
+          (apply append
+                 (for/list ([k (in-range cnt)] #:break (not (alive? ctx)))
+                   (burn! 1)
+                   (define env* (hash-set env name (+ a (* k st))))
+                   (run body env* (add1 depth))))]
+         ;; (grid cols rows body...): nested loop exposing gx (col), gy (row)
+         ;; and gi (flat index).
+         [(list* 'grid cols-e rows-e body)
+          (spend! ctx)
+          (define cols (max 0 (min 200 (inexact->exact (floor (eval-num cols-e env))))))
+          (define rows (max 0 (min 200 (inexact->exact (floor (eval-num rows-e env))))))
+          (define total (min MAX-REPEAT (* cols rows)))
+          (apply append
+                 (for/list ([gi (in-range total)] #:break (not (alive? ctx)))
+                   (burn! 1)
+                   (define env* (hash-set (hash-set (hash-set env 'gx (modulo gi cols))
+                                                    'gy (quotient gi cols)) 'gi gi))
+                   (run body env* (add1 depth))))]
          [_ (note-error! ctx "Comanda invalida" (short-str cmd) 40)]))]))
 
 ;; ---------------------------------------------------------------------------
@@ -697,12 +769,18 @@
 (define PAGE-CSS "
 :root{--bg:#0b0d14;--bg2:#0f121b;--panel:#161a26;--panel2:#1b2030;--border:#272d40;
 --border2:#333b52;--text:#e7e9f3;--muted:#9aa3bd;--purple:#bd93f9;--pink:#ff79c6;
---cyan:#8be9fd;--green:#50fa7b;--yellow:#f1fa8c;--radius:14px}
+--cyan:#8be9fd;--green:#50fa7b;--yellow:#f1fa8c;--radius:14px;--btn-text:#12131a;
+--glow1:#1a1030;--glow2:#08202b}
+/* Light shell (editor, canvas and code chips intentionally stay dark). */
+:root[data-theme=light]{--bg:#eef1f8;--bg2:#e6ebf5;--panel:#ffffff;--panel2:#f2f5fc;
+--border:#dbe1f0;--border2:#c4cce2;--text:#141a2e;--muted:#55607c;--purple:#7c3aed;
+--pink:#d6287e;--cyan:#0e7490;--green:#0a7f53;--yellow:#9a7b1f;--btn-text:#ffffff;
+--glow1:#e4d7ff;--glow2:#d4ecff}
 *{box-sizing:border-box}html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
 body{margin:0;font-family:system-ui,-apple-system,Roboto,Arial,sans-serif;color:var(--text);
 line-height:1.55;min-height:100vh;background:
-radial-gradient(1100px 560px at 82% -12%,#1a1030 0,transparent 60%),
-radial-gradient(950px 480px at -8% 8%,#08202b 0,transparent 55%),var(--bg)}
+radial-gradient(1100px 560px at 82% -12%,var(--glow1) 0,transparent 60%),
+radial-gradient(950px 480px at -8% 8%,var(--glow2) 0,transparent 55%),var(--bg)}
 a{color:var(--cyan);text-decoration:none}a:hover{text-decoration:underline}
 .wrap{max-width:1200px;margin:0 auto;padding:clamp(1rem,3.5vw,2.25rem)}
 .hero{text-align:center;margin-bottom:1.4rem}
@@ -724,7 +802,7 @@ font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 textarea:focus,input:focus,button:focus-visible,.btn:focus-visible{outline:2px solid var(--purple);outline-offset:2px}
 .toolbar{display:flex;flex-wrap:wrap;gap:.55rem;margin-top:.8rem}
 button,.btn{font:600 15px/1 system-ui,sans-serif;cursor:pointer;border:none;border-radius:10px;
-padding:.75rem 1.1rem;color:#12131a;background:var(--purple);display:inline-flex;align-items:center;
+padding:.75rem 1.1rem;color:var(--btn-text);background:var(--purple);display:inline-flex;align-items:center;
 gap:.4rem;transition:filter .15s,transform .05s}
 button:hover,.btn:hover{filter:brightness(1.08);text-decoration:none}
 button:active,.btn:active{transform:translateY(1px)}
@@ -885,6 +963,15 @@ box-shadow:0 10px 30px rgba(0,0,0,.4);transition:transform .25s;z-index:50}
     clearTimeout(deb); render(); toast('Surpriza!');
   });
 
+  // ---- theme toggle ------------------------------------------------------
+  bind('btnTheme', function(){
+    var root = document.documentElement;
+    var next = root.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+    root.setAttribute('data-theme', next);
+    try{ localStorage.setItem('theme', next); }catch(e){}
+    toast(next === 'light' ? 'Tema deschisa' : 'Tema intunecata');
+  });
+
   // ---- file-name display -------------------------------------------------
   var f = document.getElementById('image_file');
   if (f){ f.addEventListener('change', function(){ var n = document.getElementById('fname');
@@ -914,7 +1001,13 @@ ENDJS
    (list "Caleidoscop" "rotate + repeat"
          "(bg \"#0a0a12\")\n(repeat 12\n  (rotate (* i 30) 300 200\n    (repeat 10\n      (let ([r (* i 4)])\n        (circle (+ 300 (* (* i 10) (cos (* i 0.5)))) 200 (+ 3 r)\n                (hsla (* i 20) 80 60 0.7))))))")
    (list "Spirala animata" "spin + stele"
-         "(linear-bg 45 \"#1a0b2e\" \"#0b0f1a\")\n(spin 300 200 24\n  (repeat 40\n    (let ([a (* i 0.5)] [r (* i 6)])\n      (star (+ 300 (* r (cos a))) (+ 200 (* r (sin a))) 5 8 3\n            (mix \"#f1fa8c\" \"#ff79c6\" (map i 0 40 0 1))))))")))
+         "(linear-bg 45 \"#1a0b2e\" \"#0b0f1a\")\n(spin 300 200 24\n  (repeat 40\n    (let ([a (* i 0.5)] [r (* i 6)])\n      (star (+ 300 (* r (cos a))) (+ 200 (* r (sin a))) 5 8 3\n            (mix \"#f1fa8c\" \"#ff79c6\" (map i 0 40 0 1))))))")
+   (list "Caroiaj" "grid + hsv"
+         "(bg \"#0a0a12\")\n(grid 20 14\n  (let ([x (+ 20 (* gx 30))] [y (+ 20 (* gy 28))])\n    (poly x y (+ 3 (mod gi 5)) 11\n          (hsv (* (+ gx gy) 12) 80 95))))")
+   (list "Inimi" "grid + heart"
+         "(linear-bg 90 \"#2a0a1a\" \"#0b0f1a\")\n(grid 8 5\n  (let ([x (+ 45 (* gx 72))] [y (+ 55 (* gy 80))])\n    (pulse (+ 1.5 (* gi 0.1))\n      (heart x y (+ 16 (* 4 (noise gx gy))) (hsl (* gi 9) 80 65)))))")
+   (list "Raze" "bucla for"
+         "(radial-bg \"#10131f\" \"#05070f\")\n(for a 0 360 6\n  (line 300 200 (+ 300 (* 230 (cos (* a 0.0175)))) (+ 200 (* 230 (sin (* a 0.0175))))\n        (hsv a 85 95) 2))\n(circle 300 200 30 \"#f1fa8c\")")))
 
 (define (example-card title desc code)
   `(form ((method "post") (class "ex-form"))
@@ -1021,7 +1114,7 @@ ENDJS
             (meta ((charset "utf-8")))
             (title "Procedural Canvas DSL — arta SVG generativa in Racket")
             (meta ((name "viewport") (content "width=device-width, initial-scale=1")))
-            (meta ((name "color-scheme") (content "dark")))
+            (meta ((name "color-scheme") (content "dark light")))
             (meta ((name "theme-color") (content "#0b0d14")))
             (meta ((name "description")
                    (content "Un limbaj Lisp-like scris in Racket care transforma cod in arta SVG: bucle, trigonometrie, noise, gradienti, animatie si culori — randat pe server, descarcabil ca SVG sau PNG.")))
@@ -1058,7 +1151,9 @@ ENDJS
                       "\"operatingSystem\":\"Web\","
                       "\"description\":\"Un limbaj Lisp-like in Racket care randeaza arta SVG generativa din cod.\","
                       "\"offers\":{\"@type\":\"Offer\",\"price\":\"0\",\"priceCurrency\":\"EUR\"}}"))
-            (style ,PAGE-CSS))
+            (style ,PAGE-CSS)
+            ;; Apply the saved theme before first paint to avoid a flash.
+            (script "try{var t=localStorage.getItem('theme');if(t){document.documentElement.setAttribute('data-theme',t);}}catch(e){}"))
            (body
             (div ((class "wrap"))
              (header ((class "hero"))
@@ -1080,6 +1175,7 @@ ENDJS
                  (button ((type "button") (id "btnShare") (class "btn-ghost")) "🔗 Share")
                  (button ((type "button") (id "btnCopy") (class "btn-ghost")) "⧉ Copiaza")
                  (button ((type "button") (id "btnSurprise") (class "btn-pink")) "🎲 Surpriza")
+                 (button ((type "button") (id "btnTheme") (class "btn-ghost") (title "Schimba tema")) "🌓 Tema")
                  (a ((href "/") (class "btn btn-ghost")) "↺ Reset")))
                (p ((class "hint"))
                   (span ((id "status")) "Live: se randeaza pe masura ce scrii.")
@@ -1110,9 +1206,11 @@ ENDJS
                         "(triangle x1 y1 x2 y2 x3 y3 c)"
                         "(polygon culoare x1 y1 ...)" "(polyline culoare gros x1 y1 ...)"
                         "(star cx cy varfuri rext rint c)"
+                        "(poly cx cy laturi r c)" "(heart cx cy marime c)"
                         "(text x y marime culoare STR)" "(bg culoare)"))
                ,(cheat-col "Control"
                   (list "(repeat N cmd...)" "i = index in repeat"
+                        "(for nume a b [pas] cmd...)" "(grid col rand cmd...) → gx gy gi"
                         "(let ([nume val] ...) cmd...)" "(seed N) → random reproductibil"))
                ,(cheat-col "Transform / Animatie"
                   (list "(group cmd...)" "(rotate grd cx cy cmd...)"
@@ -1126,7 +1224,7 @@ ENDJS
                         "(random max) (random lo hi)" "pi tau width height"))
                ,(cheat-col "Culori"
                   (list "#rrggbb" "nume-css (red...)" "(rgb r g b)" "(rgba r g b a)"
-                        "(hsl h s l)" "(hsla h s l a)" "(mix c1 c2 t)"
+                        "(hsl h s l)" "(hsla h s l a)" "(hsv h s v)" "(mix c1 c2 t)"
                         "(linear-bg grd c1 c2 ...)" "(radial-bg c1 c2 ...)"))))
 
              (footer
@@ -1252,4 +1350,30 @@ ENDJS
     (define s (svg->str (parse-to-svg "(arc 300 200 100 0 90 \"red\" 3)(ring 100 100 40 \"cyan\" 2)(triangle 0 0 10 0 5 10 \"lime\")")))
     (check-true (regexp-match? #px"<path" s))
     (check-true (regexp-match? #px"fill=\"none\"" s))
-    (check-true (regexp-match? #px"<polygon" s))))
+    (check-true (regexp-match? #px"<polygon" s)))
+
+  ;; --- round 2: for / grid / poly / heart / hsv ------------------------------
+  (test-case "for loop binds a named variable over a range, with optional step"
+    (define a (svg->str (parse-to-svg "(for k 0 4 (circle k 0 1 \"red\"))")))
+    (check-equal? (length (regexp-match* #px"<circle" a)) 5)
+    (define b (svg->str (parse-to-svg "(for a 0 360 90 (circle a 0 1 \"red\"))")))
+    (check-equal? (length (regexp-match* #px"<circle" b)) 5)) ; 0,90,180,270,360
+
+  (test-case "for descending range iterates toward the end"
+    (define s (svg->str (parse-to-svg "(for k 5 1 (circle k 0 1 \"red\"))")))
+    (check-equal? (length (regexp-match* #px"<circle" s)) 5))
+
+  (test-case "grid exposes gx/gy/gi and is bounded"
+    (define s (svg->str (parse-to-svg "(grid 4 3 (circle gx gy gi \"red\"))")))
+    (check-equal? (length (regexp-match* #px"<circle" s)) 12)
+    ;; a huge grid is capped, not unbounded
+    (check-not-exn (lambda () (parse-to-svg "(grid 200 200 (circle gx gy 1 \"red\"))"))))
+
+  (test-case "poly and heart emit polygons; hsv yields rgb"
+    (define s (svg->str (parse-to-svg "(poly 100 100 6 40 (hsv 200 80 90))(heart 300 200 30 \"red\")")))
+    (check-equal? (length (regexp-match* #px"<polygon" s)) 2)
+    (check-true (regexp-match? #px"rgb\\([0-9]+,[0-9]+,[0-9]+\\)" s)))
+
+  (test-case "theme-independent: light palette CSS and toggle are present"
+    (check-true (regexp-match? #px"data-theme=light" PAGE-CSS))
+    (check-true (regexp-match? #px"btnTheme" PAGE-JS))))
