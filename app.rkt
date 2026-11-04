@@ -5,6 +5,7 @@
          net/url
          racket/draw
          racket/math
+         racket/sandbox
          xml)
 
 ;; ---------------------------------------------------------------------------
@@ -23,6 +24,15 @@
 (define MAX-EXPR-DEPTH  40)              ; arithmetic expression nesting depth
 (define MAX-NUMBER      1e7)             ; magnitude clamp for every computed number
 (define MAX-RANDOM      1000000)         ; upper bound handed to (random ...)
+;; The element budget above only bounds *emitted shapes*.  These additionally
+;; bound raw work and total output so that inputs which never emit a shape
+;; (invalid commands, empty `let` bodies, giant arithmetic) and point-heavy
+;; shapes (polygons/polylines/stars) are still bounded.  `call-with-limits`
+;; is the hard backstop: even an unforeseen path cannot exceed these.
+(define MAX-FUEL        2500000)         ; work units (expr nodes + iterations + points) per render
+(define MAX-TOTAL-POINTS 24000)          ; total polygon/polyline/star vertices per render (bounds output size)
+(define RENDER-TIME-SEC 3)               ; hard wall-clock backstop per render (seconds)
+(define RENDER-MEM-MB   96)              ; hard per-render memory backstop (MB)
 
 ;; ---------------------------------------------------------------------------
 ;; Numbers
@@ -57,10 +67,14 @@
 
 ;; Safe numeric evaluator for the arithmetic sub-language.  Bounded in both
 ;; recursion depth and value magnitude; symbols resolve against `env`; every
-;; unknown form evaluates to 0 rather than raising.
+;; unknown form evaluates to 0 rather than raising.  Every node also burns one
+;; unit of the shared fuel budget, so an expression like (+ 1 1 1 ... 20000x)
+;; or a loop body that only computes cannot run unbounded work.
 (define (eval-num v env [depth 0])
+  (burn! 1)
   (define (ev x) (eval-num x env (add1 depth)))
   (cond
+    [(not (fuel-left? (current-ctx))) 0]
     [(> depth MAX-EXPR-DEPTH) 0]
     [(number? v) (clamp-num (if (real? v) v 0))]
     [(symbol? v) (let ([r (hash-ref env v 0)]) (clamp-num (if (real? r) r 0)))]
@@ -81,7 +95,12 @@
         [(list '/ a b)               (let ([d (ev b)]) (if (zero? d) 0 (/ (ev a) d)))]
         [(list 'mod a b)             (safe-mod (ev a) (ev b))]
         [(list 'pow a b)             (let ([base (ev a)] [e (max -8 (min 8 (ev b)))])
-                                       (if (and (<= base 0) (not (integer? e))) 0 (expt base e)))]
+                                       ;; Guard every exponent case that raises or blows up:
+                                       ;; negative/fractional powers of non-positive bases, and
+                                       ;; exact-bignum growth (coerce the base to a flonum).
+                                       (cond [(and (<= base 0) (not (integer? e))) 0]
+                                             [(and (zero? base) (< e 0)) 0]
+                                             [else (expt (exact->inexact base) e)]))]
         [(list 'sin a)               (sin (ev a))]
         [(list 'cos a)               (cos (ev a))]
         [(list 'tan a)               (let ([c (cos (ev a))]) (if (zero? c) 0 (/ (sin (ev a)) c)))]
@@ -127,10 +146,36 @@
 ;; Render context: a shared, mutable budget so total emitted nodes are capped
 ;; regardless of how the commands are nested.
 ;; ---------------------------------------------------------------------------
-(struct rctx (budget) #:mutable)
-(define (make-rctx) (rctx MAX-ELEMENTS))
+;;   budget — shapes still allowed to emit   (caps element count)
+;;   fuel   — raw work units still allowed    (caps CPU regardless of shapes)
+;;   points — polygon/polyline/star vertices  (caps output size)
+;;   errors — error nodes already emitted     (caps error-node spam)
+(struct rctx (budget fuel points errors) #:mutable)
+(define (make-rctx) (rctx MAX-ELEMENTS MAX-FUEL MAX-TOTAL-POINTS 0))
+
+;; A parameter holding the live context, so the numeric evaluator and the
+;; geometry helpers can charge the shared budget without threading ctx through
+;; every signature.  The default is a fresh full budget (only reached by stray
+;; calls outside a render; real renders parameterize it).
+(define current-ctx (make-parameter (make-rctx)))
+
 (define (budget-left? ctx) (> (rctx-budget ctx) 0))
+(define (fuel-left?   ctx) (> (rctx-fuel   ctx) 0))
+;; A render is "alive" while it still has both shapes and work left.
+(define (alive? ctx) (and (budget-left? ctx) (fuel-left? ctx)))
 (define (spend! ctx) (set-rctx-budget! ctx (sub1 (rctx-budget ctx))))
+
+;; Burn `n` work units against the current context's fuel.
+(define (burn! [n 1])
+  (define c (current-ctx))
+  (set-rctx-fuel! c (- (rctx-fuel c) n)))
+
+;; Claim one output vertex; #f once the per-render vertex budget is spent, so
+;; point-heavy shapes truncate instead of ballooning the serialized SVG.
+(define (take-point!)
+  (define c (current-ctx))
+  (and (> (rctx-points c) 0)
+       (begin (set-rctx-points! c (sub1 (rctx-points c))) #t)))
 
 (define (short-str s)
   (define str (format "~a" s))
@@ -141,6 +186,19 @@
                 (font-family "monospace") (font-size "13"))
                ,(string-append label ": " (short-str msg)))))
 
+;; An error still emits a node, so it costs element budget (stops floods of
+;; invalid commands at the element cap).  Only the first MAX-ERROR-NODES are
+;; actually rendered — beyond that they are counted and dropped, so a hostile
+;; "all invalid" program can't balloon the output with thousands of red texts.
+(define MAX-ERROR-NODES 24)
+(define (note-error! ctx label msg base-y)
+  (spend! ctx)
+  (set-rctx-errors! ctx (add1 (rctx-errors ctx)))
+  (define k (rctx-errors ctx))
+  (if (<= k MAX-ERROR-NODES)
+      (err-node label msg (min 392 (+ base-y (* (sub1 k) 15))))
+      '()))
+
 ;; Cap text length so a single (text ...) node can't carry a megabyte of glyphs.
 (define MAX-TEXT-LEN 300)
 (define (clip-text s)
@@ -148,20 +206,22 @@
 
 ;; Turn a flat list of coordinate expressions into an SVG "x,y x,y ..." string.
 ;; Points are capped so a giant coordinate list can't bloat one element.
-(define MAX-POINTS 600)
+(define MAX-POINTS 1200)
 (define (points->str exprs env)
-  (define nums (for/list ([e (in-list exprs)] [_ (in-range (* 2 MAX-POINTS))])
+  (define nums (for/list ([e (in-list exprs)] [_ (in-range (* 2 MAX-POINTS))]
+                          #:break (not (fuel-left? (current-ctx))))
                  (eval-num e env)))
   (let loop ([xs nums] [acc '()])
     (cond
-      [(or (null? xs) (null? (cdr xs))) (string-join (reverse acc) " ")]
+      [(or (null? xs) (null? (cdr xs)) (not (take-point!)))
+       (string-join (reverse acc) " ")]
       [else (loop (cddr xs) (cons (format "~a,~a" (fmt-num (car xs)) (fmt-num (cadr xs))) acc))])))
 
 ;; Build a star / n-gon burst as a <polygon>.  Spike count is clamped.
 (define (star-xexpr cx cy spikes outer inner fill)
   (define n (max 2 (min 100 (inexact->exact (floor spikes)))))
   (define pts
-    (for/list ([k (in-range (* 2 n))])
+    (for/list ([k (in-range (* 2 n))] #:break (not (take-point!)))
       (define r (if (even? k) outer inner))
       (define ang (- (* k (/ pi n)) (/ pi 2)))
       (format "~a,~a" (fmt-num (+ cx (* r (cos ang)))) (fmt-num (+ cy (* r (sin ang)))))))
@@ -172,11 +232,14 @@
 ;; Every path is guarded so malformed or hostile input degrades to a small
 ;; error node instead of an exception/hang.
 (define (interpret cmd env ctx depth)
+  (burn! 1)
   (cond
-    [(not (budget-left? ctx)) '()]
+    [(not (alive? ctx)) '()]
     [(> depth MAX-DEPTH) '()]
     [else
-     (with-handlers ([exn:fail? (lambda (e) (err-node "Eroare interpretare" (exn-message e) 24))])
+     ;; A raised error or an invalid command still emits a node, so it must
+     ;; cost element budget — otherwise a flood of them bypasses every cap.
+     (with-handlers ([exn:fail? (lambda (e) (note-error! ctx "Eroare interpretare" (exn-message e) 24))])
        (define (n v) (fmt-num (eval-num v env)))
        (define (col c) (eval-color c env))
        (match cmd
@@ -225,11 +288,12 @@
           (spend! ctx)
           (define reps (min MAX-REPEAT (max 0 (inexact->exact (floor (eval-num count env))))))
           (apply append
-                 (for/list ([i (in-range reps)] #:break (not (budget-left? ctx)))
+                 (for/list ([i (in-range reps)] #:break (not (alive? ctx)))
+                   (burn! 1) ; charge every iteration so empty-body loops are bounded
                    (define env* (hash-set env 'i i))
                    (apply append
                           (for/list ([b (in-list body)]) (interpret b env* ctx (add1 depth))))))]
-         [_ (err-node "Comanda invalida" (short-str cmd) 40)]))]))
+         [_ (note-error! ctx "Comanda invalida" (short-str cmd) 40)]))]))
 
 ;; ---------------------------------------------------------------------------
 ;; Parsing.  We read S-expressions with a hardened reader:
@@ -256,14 +320,26 @@
 (define (parse-to-svg text)
   (define forms (safe-read-all text))
   (define ctx (make-rctx))
-  (define elements
-    (if (list? forms)
-        (apply append
-               (for/list ([c (in-list forms)] #:break (not (budget-left? ctx)))
-                 (interpret c BASE-ENV ctx 0)))
-        '()))
+  ;; Two layers of defense:
+  ;;   1. The in-interpreter fuel/budget/point caps (fast, bound the common case).
+  ;;   2. call-with-limits — a hard wall-clock + memory ceiling run in a child
+  ;;      custodian, so even an unforeseen pathological path is killed and
+  ;;      confined to THIS request instead of OOM-ing the shared process.
+  (define-values (elements limited?)
+    (with-handlers ([exn:fail:resource? (lambda (_) (values '() #t))]
+                    [exn:fail?          (lambda (_) (values '() #t))])
+      (call-with-limits RENDER-TIME-SEC RENDER-MEM-MB
+        (lambda ()
+          (parameterize ([current-ctx ctx])
+            (define els
+              (if (list? forms)
+                  (apply append
+                         (for/list ([c (in-list forms)] #:break (not (alive? ctx)))
+                           (interpret c BASE-ENV ctx 0)))
+                  '()))
+            (values els #f))))))
   (define notice
-    (if (<= (rctx-budget ctx) 0)
+    (if (or limited? (<= (rctx-budget ctx) 0) (<= (rctx-fuel ctx) 0) (<= (rctx-points ctx) 0))
         (list `(text ((x "12") (y "392") (fill "#ffb86c") (font-family "monospace") (font-size "12"))
                      "… limita de complexitate atinsa (output trunchiat)"))
         '()))
@@ -576,9 +652,75 @@ box-shadow:0 10px 30px rgba(0,0,0,.4);transition:transform .25s;z-index:50}
             (div ((id "toast") (class "toast")) "")
             (script ,PAGE-JS))))])]))
 
-(serve/servlet start
-               #:port PORT
-               #:listen-ip "127.0.0.1"
-               #:servlet-path "/"
-               #:servlet-regexp #rx""
-               #:command-line? #t)
+;; The server only starts when this file is *run* (`racket app.rkt` executes the
+;; `main` submodule).  Requiring the module — e.g. from the test submodule — runs
+;; the definitions above without binding a socket, so the interpreter can be
+;; exercised in isolation.
+(module+ main
+  (serve/servlet start
+                 #:port PORT
+                 #:listen-ip "127.0.0.1"
+                 #:servlet-path "/"
+                 #:servlet-regexp #rx""
+                 #:command-line? #t))
+
+;; ---------------------------------------------------------------------------
+;; Regression tests for the resource caps.  Run with `raco test app.rkt`.
+;; Each hostile input must (a) return in well under the hard time limit and
+;; (b) produce a bounded number of SVG nodes — proving no single request can
+;; exhaust CPU/RAM of the shared process.
+;; ---------------------------------------------------------------------------
+(module+ test
+  (require rackunit)
+
+  ;; Count every element node in a rendered xexpr tree.
+  (define (count-nodes x)
+    (cond [(and (pair? x) (symbol? (car x)))
+           (+ 1 (for/sum ([c (in-list (cddr x))]) (count-nodes c)))]
+          [(list? x) (for/sum ([c (in-list x)]) (count-nodes c))]
+          [else 0]))
+
+  (define (render-time text)
+    (define t0 (current-inexact-milliseconds))
+    (define svg (parse-to-svg text))
+    (values svg (- (current-inexact-milliseconds) t0)))
+
+  ;; Shared helper: a hostile payload must finish fast and stay bounded.
+  ;; Returns void so nothing bubbles up and clutters the raco-test log.
+  (define (check-bounded name text)
+    (define-values (svg ms) (render-time text))
+    (check-true (< ms 3500) (format "~a took ~ams (expected < 3500)" name ms))
+    (check-true (< (count-nodes svg) 60000) (format "~a emitted too many nodes" name))
+    (check-true (< (string-length (xexpr->string svg)) 2000000)
+                (format "~a serialized output too large" name))
+    (void))
+
+  (test-case "valid art renders"
+    (define svg (parse-to-svg "(bg \"#000\")(repeat 50 (circle (* i 10) 200 5 \"red\"))"))
+    (check-eq? (car svg) 'svg)
+    (check-true (> (count-nodes svg) 10)))
+
+  (test-case "invalid commands in a big repeat are bounded (no budget bypass)"
+    (check-bounded "invalid-cmd-flood"
+      (string-append "(repeat 2000 " (apply string-append (make-list 3000 "(z)")) ")")))
+
+  (test-case "empty let body with huge arithmetic is bounded (fuel cap)"
+    (check-bounded "fuel-bomb"
+      (string-append "(repeat 2000 (let ([a (+ " (apply string-append (make-list 20000 "1 ")) ")])))")))
+
+  (test-case "polygon point amplification is bounded (point + output cap)"
+    (define pts (apply string-append (make-list 600 "123.4 234.5 ")))
+    (check-bounded "point-amplification"
+      (string-append "(repeat 2000 (repeat 3 (polygon \"red\" " pts ")))")))
+
+  (test-case "nested repeat multiplication is bounded"
+    (check-bounded "nested-repeat"
+      "(repeat 2000 (repeat 2000 (circle 1 1 1 \"red\")))"))
+
+  (test-case "pow edge cases do not raise"
+    (check-not-exn (lambda () (parse-to-svg "(circle (pow 0 -1) (pow -2 0.5) 5 \"red\")")))
+    (check-not-exn (lambda () (parse-to-svg "(circle (pow 1e7 8) 1 1 \"red\")"))))
+
+  (test-case "cyclic / reader payloads are rejected by the reader"
+    (check-not-exn (lambda () (parse-to-svg "#0=(1 . #0#)")))
+    (check-not-exn (lambda () (parse-to-svg "#lang racket")))))
