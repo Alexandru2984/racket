@@ -3,6 +3,7 @@
          web-server/servlet-env
          web-server/http/bindings
          net/url
+         net/base64
          racket/draw
          racket/math
          racket/sandbox
@@ -613,6 +614,22 @@
 (define (req-path req)
   (string-join (map path/param-path (url-path (request-uri req))) "/"))
 
+;; Decode a shared program from the ?c= permalink: standard base64 of the
+;; UTF-8 source.  Bounded and failure-tolerant (bad input -> #f).
+(define MAX-SHARE-CHARS 12000)
+(define (decode-share s)
+  (with-handlers ([exn:fail? (lambda (_) #f)])
+    (and (string? s) (non-empty-string? s) (<= (string-length s) MAX-SHARE-CHARS)
+         (let ([txt (bytes->string* (base64-decode (string->bytes/utf-8 s)))])
+           (and (non-empty-string? txt) (clip-code txt))))))
+
+;; Count emitted element nodes in a rendered SVG (for the live status line).
+(define (count-svg-nodes x)
+  (cond [(and (pair? x) (symbol? (car x)))
+         (for/fold ([acc 1]) ([c (in-list (cddr x))]) (+ acc (count-svg-nodes c)))]
+        [(list? x) (for/fold ([acc 0]) ([c (in-list x)]) (+ acc (count-svg-nodes c)))]
+        [else 0]))
+
 (define DEFAULT-CODE
   (string-append
    ";; (i) = indexul buclei. Incearca: noise, mix, gradient, spin, seed.\n"
@@ -670,6 +687,9 @@ button:active,.btn:active{transform:translateY(1px)}
 .stage{background:#000;border:1px solid var(--border);border-radius:var(--radius);padding:.55rem;overflow:hidden}
 .stage svg{width:100%;height:auto;display:block}
 .hint{color:var(--muted);font-size:.85rem;margin:.55rem 0 0}
+kbd{font:600 11px ui-monospace,Menlo,monospace;background:#0b0e17;border:1px solid var(--border2);
+border-bottom-width:2px;border-radius:5px;padding:.08rem .35rem;color:var(--cyan)}
+#status{color:var(--green)}
 .examples{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:.6rem}
 .ex-form{margin:0;display:block}
 .ex{width:100%;padding:.7rem .8rem;text-align:left;background:var(--panel2);border:1px solid var(--border);
@@ -698,23 +718,134 @@ box-shadow:0 10px 30px rgba(0,0,0,.4);transition:transform .25s;z-index:50}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
 ")
 
-;; Kept free of & < > so it survives xexpr's pcdata escaping unchanged.
-(define PAGE-JS "
+;; Served from /app.js (CSP script-src 'self'), so it can use < > & freely.
+;; Progressive enhancement: the page is fully usable without it (plain POST
+;; forms). It adds live preview, Ctrl+Enter, Tab indent, PNG export, share
+;; links, copy and a "surprise me" generator.
+(define PAGE-JS #<<ENDJS
 (function(){
-  var ta=document.getElementById('code');
-  function toast(m){var t=document.getElementById('toast');if(!t){return;}
-    t.textContent=m;t.classList.add('show');clearTimeout(window.__tt);
-    window.__tt=setTimeout(function(){t.classList.remove('show');},1800);}
-  function fallback(){if(!ta){return;}ta.focus();ta.select();try{document.execCommand('copy');}catch(e){}toast('Cod copiat');}
-  function copyCode(){if(!ta){return;}
-    if(navigator.clipboard){navigator.clipboard.writeText(ta.value).then(function(){toast('Cod copiat');},fallback);}
-    else{fallback();}}
-  var b=document.getElementById('btnCopy');if(b){b.addEventListener('click',copyCode);}
-  var f=document.getElementById('image_file');
-  if(f){f.addEventListener('change',function(){var n=document.getElementById('fname');
-    if(n){n.textContent=f.files[0]?f.files[0].name:'';}});}
+  "use strict";
+  var ta = document.getElementById('code');
+  var stage = document.getElementById('stage');
+  var statusEl = document.getElementById('status');
+  var toastEl = document.getElementById('toast');
+  var tt, deb;
+
+  function bind(id, fn){ var el = document.getElementById(id); if (el){ el.addEventListener('click', fn); } }
+  function toast(m){ if (!toastEl) return; toastEl.textContent = m; toastEl.classList.add('show');
+    clearTimeout(tt); tt = setTimeout(function(){ toastEl.classList.remove('show'); }, 1800); }
+  function setStatus(m){ if (statusEl) statusEl.textContent = m; }
+
+  // ---- live render -------------------------------------------------------
+  var inflight = false, pending = false;
+  function render(){
+    if (!ta || !stage) return;
+    if (inflight){ pending = true; return; }
+    inflight = true; setStatus('se randeaza...');
+    var t0 = performance.now();
+    fetch('/api/render', { method:'POST',
+        headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
+        body:'code=' + encodeURIComponent(ta.value) })
+      .then(function(r){ var ms = r.headers.get('X-Render-Ms'), el = r.headers.get('X-Elements');
+        return r.text().then(function(t){ return { t:t, ms:ms, el:el }; }); })
+      .then(function(o){ stage.innerHTML = o.t;
+        var ms = (o.ms != null) ? o.ms : Math.round(performance.now() - t0);
+        setStatus((o.el || '?') + ' elemente · ' + ms + ' ms'); })
+      .catch(function(){ setStatus('eroare de retea'); })
+      .then(function(){ inflight = false; if (pending){ pending = false; render(); } });
+  }
+  function scheduleRender(){ clearTimeout(deb); deb = setTimeout(render, 450); }
+
+  if (ta){
+    ta.addEventListener('input', scheduleRender);
+    ta.addEventListener('keydown', function(e){
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter'){ e.preventDefault(); clearTimeout(deb); render(); }
+      else if (e.key === 'Tab'){ e.preventDefault();
+        var s = ta.selectionStart, en = ta.selectionEnd;
+        ta.value = ta.value.slice(0, s) + '  ' + ta.value.slice(en);
+        ta.selectionStart = ta.selectionEnd = s + 2; scheduleRender(); }
+    });
+  }
+
+  // Intercept the "Randeaza" submit so JS users get a live render with no
+  // full-page reload; "Download SVG" still submits normally, and with JS off
+  // both buttons POST the form as before.
+  var form = document.getElementById('editForm');
+  if (form){
+    form.addEventListener('submit', function(e){
+      var btn = e.submitter;
+      if (btn && btn.value === 'preview'){ e.preventDefault(); clearTimeout(deb); render(); }
+    });
+  }
+
+  // ---- copy / share ------------------------------------------------------
+  function fallbackCopy(){ if (ta){ ta.focus(); ta.select(); } try{ document.execCommand('copy'); }catch(e){} }
+  function copyText(text, msg){
+    if (navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(function(){ toast(msg); }, function(){ fallbackCopy(); toast(msg); });
+    } else { fallbackCopy(); toast(msg); }
+  }
+  bind('btnCopy', function(){ if (ta) copyText(ta.value, 'Cod copiat'); });
+
+  function encode(code){ return encodeURIComponent(btoa(unescape(encodeURIComponent(code)))); }
+  bind('btnShare', function(){
+    if (!ta) return;
+    var enc = encode(ta.value);
+    if (enc.length > 8000){ toast('Cod prea mare pentru link — foloseste Download SVG'); return; }
+    var url = location.origin + location.pathname + '?c=' + enc;
+    copyText(url, 'Link copiat in clipboard');
+    try{ history.replaceState(null, '', url); } catch(e){}
+  });
+
+  // ---- PNG export (client-side rasterization) ----------------------------
+  bind('btnPng', function(){
+    var svg = stage ? stage.querySelector('svg') : null;
+    if (!svg){ toast('Nimic de exportat'); return; }
+    var xml = new XMLSerializer().serializeToString(svg);
+    var img = new Image();
+    img.onload = function(){
+      var scale = 2, c = document.createElement('canvas');
+      c.width = 600 * scale; c.height = 400 * scale;
+      var cx = c.getContext('2d');
+      cx.fillStyle = '#000'; cx.fillRect(0, 0, c.width, c.height);
+      cx.setTransform(scale, 0, 0, scale, 0, 0);
+      cx.drawImage(img, 0, 0, 600, 400);
+      c.toBlob(function(b){
+        if (!b){ toast('PNG esuat'); return; }
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(b); a.download = 'procedural_art.png';
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function(){ URL.revokeObjectURL(a.href); }, 2000);
+        toast('PNG descarcat');
+      }, 'image/png');
+    };
+    img.onerror = function(){ toast('PNG esuat'); };
+    img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(xml)));
+  });
+
+  // ---- surprise me -------------------------------------------------------
+  function ri(a, b){ return a + Math.floor(Math.random() * (b - a + 1)); }
+  function rf(a, b){ return (a + Math.random() * (b - a)).toFixed(2); }
+  var templates = [
+    function(s){ return '(linear-bg ' + ri(0,180) + ' "#05070f" "#1a1030")\n(seed ' + s + ')\n(repeat 1200\n  (let ([x (random 600)] [y (random 400)]\n        [a (* 6.28 (noise (* x 0.01) (* y 0.01)))])\n    (line x y (+ x (* 16 (cos a))) (+ y (* 16 (sin a)))\n          (mix "#8be9fd" "#ff79c6" (noise (* x 0.02) (* y 0.02))) 1.4)))'; },
+    function(s){ return '(bg "#0b0f1a")\n(seed ' + s + ')\n(spin 300 200 ' + ri(16,38) + '\n  (repeat ' + ri(70,140) + '\n    (circle (+ 300 (* (* i 2.2) (cos (* i ' + rf(0.2,0.45) + ')))) (+ 200 (* (* i 2.2) (sin (* i ' + rf(0.2,0.45) + ')))) 6 (hsl (* i ' + ri(3,8) + ') 85 60))))'; },
+    function(s){ return '(radial-bg "#fff3b0" "#ff8c42" "#1a0b2e")\n(seed ' + s + ')\n(repeat 12\n  (rotate (* i 30) 300 200\n    (repeat 14\n      (star (+ 300 (* i 16)) 200 5 10 4 (hsla (* i 24) 80 62 0.7)))))'; },
+    function(s){ return '(bg "#05070f")\n(seed ' + s + ')\n(repeat 90\n  (let ([a (* i 0.18)] [r (* 170 (cos (* ' + ri(3,7) + ' (* i 0.18))))])\n    (circle (+ 300 (* r (cos a))) (+ 200 (* r (sin a))) 5 (mix "#50fa7b" "#8be9fd" (map i 0 90 0 1)))))'; },
+    function(s){ return '(linear-bg 90 "#0a0a12" "#161032")\n(seed ' + s + ')\n(pulse 3\n  (repeat 60\n    (ring (random 600) (random 400) (random 6 40) (hsl (random 360) 75 62) 2)))'; }
+  ];
+  bind('btnSurprise', function(){
+    if (!ta) return;
+    ta.value = templates[ri(0, templates.length - 1)](ri(1, 99999));
+    clearTimeout(deb); render(); toast('Surpriza!');
+  });
+
+  // ---- file-name display -------------------------------------------------
+  var f = document.getElementById('image_file');
+  if (f){ f.addEventListener('change', function(){ var n = document.getElementById('fname');
+    if (n){ n.textContent = f.files[0] ? f.files[0].name : ''; } }); }
 })();
-")
+ENDJS
+)
 
 ;; Preset programs — each is a plain POST form, so they work without JS.
 (define EXAMPLES
@@ -769,6 +900,26 @@ box-shadow:0 10px 30px rgba(0,0,0,.4);transition:transform .25s;z-index:50}
     [(equal? (req-path req) "health")
      (response/full 200 #"OK" (current-seconds) #"text/plain" '() (list #"ok"))]
 
+    ;; Front-end script, served from same origin (CSP script-src 'self').
+    [(equal? (req-path req) "app.js")
+     (response/full 200 #"OK" (current-seconds) #"application/javascript; charset=utf-8"
+                    (list (make-header #"Cache-Control" #"public, max-age=3600"))
+                    (list (string->bytes/utf-8 PAGE-JS)))]
+
+    ;; Live-preview API: POST code -> SVG, with render stats in headers.  Same
+    ;; strict caps as the page render; used by the debounced editor.
+    [(equal? (req-path req) "api/render")
+     (define code (extract-form-value #"code"))
+     (define t0 (current-inexact-milliseconds))
+     (define svg (parse-to-svg (if (non-empty-string? code) code DEFAULT-CODE)))
+     (define ms (inexact->exact (round (- (current-inexact-milliseconds) t0))))
+     (response/full
+      200 #"OK" (current-seconds) #"image/svg+xml; charset=utf-8"
+      (list (make-header #"X-Render-Ms" (string->bytes/utf-8 (number->string ms)))
+            (make-header #"X-Elements" (string->bytes/utf-8 (number->string (count-svg-nodes svg))))
+            (make-header #"Cache-Control" #"no-store"))
+      (list (string->bytes/utf-8 (xexpr->string svg))))]
+
     [else
      (define action (extract-form-value #"action"))
      (define code-val (extract-form-value #"code"))
@@ -783,7 +934,10 @@ box-shadow:0 10px 30px rgba(0,0,0,.4);transition:transform .25s;z-index:50}
             [(> (bytes-length uploaded-file) MAX-UPLOAD-BYTES)
              ";; Eroare: fisier prea mare (max 3 MB)."]
             [else (image->dsl uploaded-file)])]
-         [else code-val]))
+         [(non-empty-string? code-val) code-val]
+         ;; ?c= permalink (shared creation)
+         [(decode-share (extract-form-value #"c")) => values]
+         [else ""]))
 
      (define final-code
        (if (non-empty-string? initial-code) initial-code DEFAULT-CODE))
@@ -820,20 +974,25 @@ box-shadow:0 10px 30px rgba(0,0,0,.4);transition:transform .25s;z-index:50}
              (div ((class "grid"))
               (section ((class "panel"))
                (h2 "Editor")
-               (form ((method "post"))
+               (form ((method "post") (id "editForm"))
                 (textarea ((id "code") (name "code") (spellcheck "false")
                            (autocomplete "off") (autocapitalize "off") (autocorrect "off")
                            (placeholder "Codul tau aici...")) ,final-code)
                 (div ((class "toolbar"))
                  (button ((type "submit") (name "action") (value "preview")) "▶ Randeaza")
-                 (button ((type "submit") (name "action") (value "download") (class "btn-cyan")) "⭳ Download SVG")
+                 (button ((type "submit") (name "action") (value "download") (class "btn-cyan")) "⭳ SVG")
+                 (button ((type "button") (id "btnPng") (class "btn-ghost")) "⤓ PNG")
+                 (button ((type "button") (id "btnShare") (class "btn-ghost")) "🔗 Share")
                  (button ((type "button") (id "btnCopy") (class "btn-ghost")) "⧉ Copiaza")
+                 (button ((type "button") (id "btnSurprise") (class "btn-pink")) "🎲 Surpriza")
                  (a ((href "/") (class "btn btn-ghost")) "↺ Reset")))
-               (p ((class "hint")) "Sfat: in (repeat N ...) variabila (i) e indexul iteratiei. Referinta completa mai jos."))
+               (p ((class "hint"))
+                  (span ((id "status")) "Live: se randeaza pe masura ce scrii.")
+                  " · " (kbd "Ctrl+Enter") " randeaza · " (kbd "Tab") " indenteaza."))
 
               (section ((class "panel"))
                (h2 "Panza (600 × 400)")
-               (div ((class "stage")) ,(parse-to-svg final-code))
+               (div ((class "stage") (id "stage")) ,(parse-to-svg final-code))
                (h2 ((style "margin-top:1.15rem")) "Imagine → cod DSL")
                (form ((method "post") (enctype "multipart/form-data") (class "file-row"))
                 (input ((type "hidden") (name "action") (value "upload")))
@@ -879,7 +1038,7 @@ box-shadow:0 10px 30px rgba(0,0,0,.4);transition:transform .25s;z-index:50}
               (p "Procedural Canvas DSL · scris in Racket cu web-server · "
                  (a ((href "https://github.com/Alexandru2984/racket") (target "_blank") (rel "noopener")) "cod sursa"))))
             (div ((id "toast") (class "toast")) "")
-            (script ,PAGE-JS))))])]))
+            (script ((src "/app.js") (defer "defer"))))))])]))
 
 ;; The server only starts when this file is *run* (`racket app.rkt` executes the
 ;; `main` submodule).  Requiring the module — e.g. from the test submodule — runs
