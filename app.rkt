@@ -623,6 +623,51 @@
          (let ([txt (bytes->string* (base64-decode (string->bytes/utf-8 s)))])
            (and (non-empty-string? txt) (clip-code txt))))))
 
+;; ---------------------------------------------------------------------------
+;; Social share image (Open Graph / Twitter).  Rendered once with racket/draw
+;; to a real PNG — SVG OG images are poorly supported by scrapers — and cached.
+;; ---------------------------------------------------------------------------
+(define og-png-cache #f)
+(define (og-png-bytes)
+  (or og-png-cache
+      (let ()
+        (define W 1200) (define H 630)
+        (define bmp (make-object bitmap% W H))
+        (define dc (make-object bitmap-dc% bmp))
+        (send dc set-smoothing 'smoothed)
+        (send dc set-pen "black" 0 'transparent)
+        ;; vertical gradient background
+        (for ([y (in-range 0 H 2)])
+          (define t (/ y (exact->inexact H)))
+          (send dc set-brush (make-object color%
+                               (inexact->exact (round (+ 11 (* t 15))))
+                               (inexact->exact (round (+ 13 (* t 6))))
+                               (inexact->exact (round (+ 20 (* t 28))))) 'solid)
+          (send dc draw-rectangle 0 y W 2))
+        ;; procedural swirl (the signature default art), upper-right
+        (for ([i (in-range 230)])
+          (define a (* i 0.33)) (define r (* i 1.95))
+          (define x (+ 820 (* r (cos a)))) (define y (+ 250 (* r (sin a))))
+          (match-define (list cr cg cb) (hsl->rgb (* i 4) 85 62))
+          (send dc set-brush (make-object color% cr cg cb) 'solid)
+          (send dc draw-ellipse (- x 8) (- y 8) 16 16))
+        ;; dark scrim over the lower band so the title stays legible over art
+        (send dc set-alpha 0.62)
+        (send dc set-brush (make-object color% 8 9 16) 'solid)
+        (send dc draw-rectangle 0 380 W 250)
+        (send dc set-alpha 1.0)
+        ;; title + tagline
+        (send dc set-text-foreground (make-object color% 231 233 243))
+        (send dc set-font (make-object font% 58 'default 'normal 'bold))
+        (send dc draw-text "Procedural Canvas DSL" 70 440)
+        (send dc set-text-foreground (make-object color% 154 163 189))
+        (send dc set-font (make-object font% 29 'default 'normal 'normal))
+        (send dc draw-text "Scrie cod Lisp, obtii arta SVG · Racket + web-server" 72 522)
+        (define out (open-output-bytes))
+        (send bmp save-file out 'png)
+        (set! og-png-cache (get-output-bytes out))
+        og-png-cache)))
+
 ;; Count emitted element nodes in a rendered SVG (for the live status line).
 (define (count-svg-nodes x)
   (cond [(and (pair? x) (symbol? (car x)))
@@ -653,7 +698,7 @@
 :root{--bg:#0b0d14;--bg2:#0f121b;--panel:#161a26;--panel2:#1b2030;--border:#272d40;
 --border2:#333b52;--text:#e7e9f3;--muted:#9aa3bd;--purple:#bd93f9;--pink:#ff79c6;
 --cyan:#8be9fd;--green:#50fa7b;--yellow:#f1fa8c;--radius:14px}
-*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
 body{margin:0;font-family:system-ui,-apple-system,Roboto,Arial,sans-serif;color:var(--text);
 line-height:1.55;min-height:100vh;background:
 radial-gradient(1100px 560px at 82% -12%,#1a1030 0,transparent 60%),
@@ -668,7 +713,8 @@ background:linear-gradient(90deg,var(--purple),var(--pink),var(--cyan));
 .badge{display:inline-block;font-size:.7rem;letter-spacing:.09em;text-transform:uppercase;
 color:var(--purple);border:1px solid var(--border2);border-radius:999px;padding:.2rem .7rem;margin-bottom:.5rem}
 .grid{display:grid;gap:1.15rem;grid-template-columns:1fr}
-@media(min-width:920px){.grid{grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:start}}
+@media(min-width:920px){.grid{grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:start}
+.grid>.panel:nth-child(2){position:sticky;top:1rem}}
 .panel{background:linear-gradient(180deg,var(--panel),var(--bg2));border:1px solid var(--border);
 border-radius:var(--radius);padding:clamp(.9rem,2.5vw,1.25rem);box-shadow:0 12px 30px rgba(0,0,0,.35)}
 .panel h2{font-size:.82rem;margin:0 0 .7rem;color:var(--muted);text-transform:uppercase;letter-spacing:.07em}
@@ -900,6 +946,23 @@ ENDJS
     [(equal? (req-path req) "health")
      (response/full 200 #"OK" (current-seconds) #"text/plain" '() (list #"ok"))]
 
+    ;; Open Graph / Twitter share image (rendered once, cached).
+    [(equal? (req-path req) "og.png")
+     (response/full 200 #"OK" (current-seconds) #"image/png"
+                    (list (make-header #"Cache-Control" #"public, max-age=86400"))
+                    (list (og-png-bytes)))]
+
+    ;; Minimal sitemap for the single public page.
+    [(equal? (req-path req) "sitemap.xml")
+     (response/full 200 #"OK" (current-seconds) #"application/xml; charset=utf-8"
+                    (list (make-header #"Cache-Control" #"public, max-age=86400"))
+                    (list (string->bytes/utf-8
+                           (string-append
+                            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+                            "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">"
+                            "<url><loc>https://racket.micutu.com/</loc><changefreq>weekly</changefreq><priority>1.0</priority></url>"
+                            "</urlset>"))))]
+
     ;; Front-end script, served from same origin (CSP script-src 'self').
     [(equal? (req-path req) "app.js")
      (response/full 200 #"OK" (current-seconds) #"application/javascript; charset=utf-8"
@@ -956,13 +1019,45 @@ ENDJS
          `(html ((lang "ro"))
            (head
             (meta ((charset "utf-8")))
-            (title "Procedural Canvas DSL — Racket")
+            (title "Procedural Canvas DSL — arta SVG generativa in Racket")
             (meta ((name "viewport") (content "width=device-width, initial-scale=1")))
             (meta ((name "color-scheme") (content "dark")))
+            (meta ((name "theme-color") (content "#0b0d14")))
             (meta ((name "description")
-                   (content "Un mic limbaj Lisp-like scris in Racket care randeaza arta SVG: bucle, trigonometrie, culori si forme procedurale.")))
+                   (content "Un limbaj Lisp-like scris in Racket care transforma cod in arta SVG: bucle, trigonometrie, noise, gradienti, animatie si culori — randat pe server, descarcabil ca SVG sau PNG.")))
+            (meta ((name "keywords")
+                   (content "arta generativa, procedural, SVG, Racket, DSL, creative coding, noise, generative art")))
+            (link ((rel "canonical") (href "https://racket.micutu.com/")))
+            ;; Open Graph
+            (meta ((property "og:type") (content "website")))
+            (meta ((property "og:site_name") (content "Procedural Canvas DSL")))
+            (meta ((property "og:title") (content "Procedural Canvas DSL — arta SVG generativa in Racket")))
+            (meta ((property "og:description")
+                   (content "Scrie cod Lisp, obtii arta SVG. Bucle, trigonometrie, noise, gradienti si animatie — totul randat pe server.")))
+            (meta ((property "og:url") (content "https://racket.micutu.com/")))
+            (meta ((property "og:image") (content "https://racket.micutu.com/og.png")))
+            (meta ((property "og:image:width") (content "1200")))
+            (meta ((property "og:image:height") (content "630")))
+            (meta ((property "og:locale") (content "ro_RO")))
+            ;; Twitter
+            (meta ((name "twitter:card") (content "summary_large_image")))
+            (meta ((name "twitter:title") (content "Procedural Canvas DSL")))
+            (meta ((name "twitter:description")
+                   (content "Scrie cod Lisp, obtii arta SVG generativa. Randat in Racket.")))
+            (meta ((name "twitter:image") (content "https://racket.micutu.com/og.png")))
             (link ((rel "icon")
                    (href "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0d14'/%3E%3Ccircle cx='16' cy='16' r='9' fill='%23bd93f9'/%3E%3C/svg%3E")))
+            (link ((rel "sitemap") (type "application/xml") (href "/sitemap.xml")))
+            ;; Structured data for search engines
+            (script ((type "application/ld+json"))
+                    ,(string-append
+                      "{\"@context\":\"https://schema.org\",\"@type\":\"WebApplication\","
+                      "\"name\":\"Procedural Canvas DSL\","
+                      "\"url\":\"https://racket.micutu.com/\","
+                      "\"applicationCategory\":\"DesignApplication\","
+                      "\"operatingSystem\":\"Web\","
+                      "\"description\":\"Un limbaj Lisp-like in Racket care randeaza arta SVG generativa din cod.\","
+                      "\"offers\":{\"@type\":\"Offer\",\"price\":\"0\",\"priceCurrency\":\"EUR\"}}"))
             (style ,PAGE-CSS))
            (body
             (div ((class "wrap"))
