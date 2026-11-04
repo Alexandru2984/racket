@@ -182,6 +182,8 @@
     [(list 'hsla h s l a)   (format "hsla(~a,~a%,~a%,~a)"  (clamp-360 (ev h)) (clamp-pct (ev s)) (clamp-pct (ev l)) (clamp-unit (ev a)))]
     ;; (hsv h s v): hue 0..360, saturation/value 0..100 — handy for vivid art.
     [(list 'hsv h s v)      (match-define (list r g b) (hsv->rgb (ev h) (ev s) (ev v))) (format "rgb(~a,~a,~a)" r g b)]
+    ;; (palette "name" i): pick a curated color by index.
+    [(list 'palette (? string? name) i) (palette-color name (ev i))]
     ;; (mix c1 c2 t): linear RGB interpolation between any two colors at t in
     ;; [0,1] — smooth gradients across a loop without SVG <defs>.
     [(list 'mix c1 c2 t)    (match-define (list r g b) (mix-rgb c1 c2 (ev t) env)) (format "rgb(~a,~a,~a)" r g b)]
@@ -197,6 +199,21 @@
         "pink" '(255 192 203) "gray" '(128 128 128) "grey" '(128 128 128)
         "navy" '(0 0 128) "teal" '(0 128 128) "gold" '(255 215 0) "tomato" '(255 99 71)
         "coral" '(255 127 80) "indigo" '(75 0 130) "violet" '(238 130 238)))
+
+;; Named palettes — (palette "name" i) cycles through curated colors, so good
+;; art is one call away.  Unknown names fall back to a neutral ramp.
+(define PALETTES
+  (hash "fire"   (vector "#2b0a00" "#7a1500" "#d13300" "#ff6a00" "#ffb300" "#ffe066")
+        "ocean"  (vector "#021d2e" "#063a53" "#0a6f8f" "#18a7c0" "#5fd3d8" "#bff3ee")
+        "neon"   (vector "#ff2a6d" "#d300c5" "#7700ff" "#00e5ff" "#39ff14" "#f5ff00")
+        "pastel" (vector "#ffd1dc" "#ffe7c2" "#fff5ba" "#d4f0c0" "#c7e9ff" "#e3d1ff")
+        "sunset" (vector "#0d1b2a" "#3b185f" "#88307a" "#d34e8c" "#ff7e5f" "#ffd080")
+        "forest" (vector "#06230f" "#114d2a" "#2e7d32" "#66bb6a" "#aed581" "#e6ee9c")
+        "mono"   (vector "#111111" "#444444" "#777777" "#aaaaaa" "#dddddd" "#ffffff")))
+
+(define (palette-color name i)
+  (define v (hash-ref PALETTES (string-downcase (string-trim name)) #f))
+  (if v (vector-ref v (modulo (inexact->exact (floor i)) (vector-length v))) "#888888"))
 
 (define (hex->rgb s)
   (define h (substring s 1))
@@ -244,6 +261,7 @@
     [(list 'hsl h s l)     (hsl->rgb (ev h) (ev s) (ev l))]
     [(list 'hsla h s l _)  (hsl->rgb (ev h) (ev s) (ev l))]
     [(list 'hsv h s v)     (hsv->rgb (ev h) (ev s) (ev v))]
+    [(list 'palette (? string? name) i) (hex->rgb (palette-color name (ev i)))]
     [(list 'mix c1 c2 t)   (mix-rgb c1 c2 (ev t) env)]
     [(? string?) (let ([s (string-downcase (string-trim c))])
                    (cond [(regexp-match? #px"^#[0-9a-fA-F]{3,8}$" s) (hex->rgb s)]
@@ -264,10 +282,11 @@
 ;;   fuel   — raw work units still allowed    (caps CPU regardless of shapes)
 ;;   points — polygon/polyline/star vertices  (caps output size)
 ;;   errors — error nodes already emitted     (caps error-node spam)
-;;   defs   — accumulated <defs> children (gradients), newest first
-;;   gid    — monotonic id counter for generated gradient ids
-(struct rctx (budget fuel points errors defs gid) #:mutable)
-(define (make-rctx) (rctx MAX-ELEMENTS MAX-FUEL MAX-TOTAL-POINTS 0 '() 0))
+;;   defs   — accumulated <defs> children (gradients/filters), newest first
+;;   gid    — monotonic id counter for generated ids
+;;   defcache — dedup identical filter defs so repeated effects share one <filter>
+(struct rctx (budget fuel points errors defs gid defcache) #:mutable)
+(define (make-rctx) (rctx MAX-ELEMENTS MAX-FUEL MAX-TOTAL-POINTS 0 '() 0 (make-hash)))
 
 ;; A parameter holding the live context, so the numeric evaluator and the
 ;; geometry helpers can charge the shared budget without threading ctx through
@@ -387,6 +406,63 @@
           (stroke-linecap "round"))
          ""))
 
+;; Smooth open curve through a list of coordinate exprs, as a cubic-bezier
+;; <path> (Catmull-Rom -> Bezier).  Point count is capped like polylines.
+(define (curve-xexpr exprs env stroke width)
+  (define nums (for/list ([e (in-list exprs)] [_ (in-range (* 2 MAX-POINTS))]
+                          #:break (not (fuel-left? (current-ctx))))
+                 (eval-num e env)))
+  (define pts
+    (let loop ([xs nums] [acc '()])
+      (if (or (null? xs) (null? (cdr xs)) (not (take-point!)))
+          (reverse acc)
+          (loop (cddr xs) (cons (cons (car xs) (cadr xs)) acc)))))
+  (cond
+    [(< (length pts) 2) `(g () "")]
+    [else
+     (define vp (list->vector pts))
+     (define n (vector-length vp))
+     (define (px i) (car (vector-ref vp (max 0 (min (sub1 n) i)))))
+     (define (py i) (cdr (vector-ref vp (max 0 (min (sub1 n) i)))))
+     (define d (open-output-string))
+     (fprintf d "M ~a ~a" (fmt-num (px 0)) (fmt-num (py 0)))
+     (for ([i (in-range (sub1 n))])
+       (define c1x (+ (px i) (/ (- (px (add1 i)) (px (sub1 i))) 6.0)))
+       (define c1y (+ (py i) (/ (- (py (add1 i)) (py (sub1 i))) 6.0)))
+       (define c2x (- (px (add1 i)) (/ (- (px (+ i 2)) (px i)) 6.0)))
+       (define c2y (- (py (add1 i)) (/ (- (py (+ i 2)) (py i)) 6.0)))
+       (fprintf d " C ~a ~a ~a ~a ~a ~a" (fmt-num c1x) (fmt-num c1y)
+                (fmt-num c2x) (fmt-num c2y) (fmt-num (px (add1 i))) (fmt-num (py (add1 i)))))
+     `(path ((d ,(get-output-string d)) (fill "none") (stroke ,stroke)
+             (stroke-width ,(fmt-num width)) (stroke-linecap "round") (stroke-linejoin "round")) "")]))
+
+;; Archimedean spiral from radius r0 to r1 over `turns` turns, as a stroked path.
+(define (spiral-xexpr cx cy turns r0 r1 stroke width)
+  (define tt (max 0.1 (min 30 (abs turns))))
+  (define steps (max 2 (min 1200 (inexact->exact (floor (* tt 40))))))
+  (define d (open-output-string))
+  (for ([k (in-range (add1 steps))] #:break (not (take-point!)))
+    (define f (/ k (exact->inexact steps)))
+    (define ang (* f tt 2 pi))
+    (define r (+ r0 (* (- r1 r0) f)))
+    (define x (+ cx (* r (cos ang)))) (define y (+ cy (* r (sin ang))))
+    (fprintf d "~a~a ~a" (if (= k 0) "M " " L ") (fmt-num x) (fmt-num y)))
+  `(path ((d ,(get-output-string d)) (fill "none") (stroke ,stroke)
+          (stroke-width ,(fmt-num width)) (stroke-linecap "round")) ""))
+
+;; Filled pie slice (sector) from angle a0 to a1 (degrees).
+(define (sector-xexpr cx cy r a0 a1 fill)
+  (define rr (abs r))
+  (define r0 (degrees->radians a0)) (define r1 (degrees->radians a1))
+  (define x0 (+ cx (* rr (cos r0)))) (define y0 (+ cy (* rr (sin r0))))
+  (define x1 (+ cx (* rr (cos r1)))) (define y1 (+ cy (* rr (sin r1))))
+  (define large (if (> (abs (- a1 a0)) 180) 1 0))
+  (define sweep (if (>= a1 a0) 1 0))
+  `(path ((d ,(format "M ~a ~a L ~a ~a A ~a ~a 0 ~a ~a ~a ~a Z"
+                      (fmt-num cx) (fmt-num cy) (fmt-num x0) (fmt-num y0)
+                      (fmt-num rr) (fmt-num rr) large sweep (fmt-num x1) (fmt-num y1)))
+          (fill ,fill)) ""))
+
 ;; Build a gradient <defs> node (linear or radial) with evenly spaced stops
 ;; from a list of color strings, and return its url(#id) reference.
 (define (gradient-url kind colors env [extra '()])
@@ -402,6 +478,37 @@
            `(linearGradient ((id ,gid) ,@extra) ,@stops)
            `(radialGradient ((id ,gid) ,@extra) ,@stops)))))
   (format "url(#~a)" id))
+
+;; Register an SVG <filter> (wide region so blurs/glows don't clip) built from
+;; the given primitive nodes, and return its url(#id) reference.  Identical
+;; filters are deduplicated, so a loop that glows thousands of shapes emits one
+;; <filter>, not thousands.
+(define (filter-url . prims)
+  (define cache (rctx-defcache (current-ctx)))
+  (or (hash-ref cache prims #f)
+      (let ([url (format "url(#~a)"
+                         (add-def!
+                          (lambda (fid)
+                            `(filter ((id ,fid) (x "-50%") (y "-50%") (width "200%") (height "200%")) ,@prims))))])
+        (hash-set! cache prims url)
+        url)))
+
+(define (blur-filter amount)
+  (filter-url `(feGaussianBlur ((in "SourceGraphic") (stdDeviation ,(fmt-num amount))) "")))
+
+(define (glow-filter color amount)
+  (filter-url
+   `(feColorMatrix ((in "SourceAlpha") (type "matrix")
+                    (values "0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 1 0") (result "a")) "")
+   `(feGaussianBlur ((in "a") (stdDeviation ,(fmt-num amount)) (result "b")) "")
+   `(feFlood ((flood-color ,color) (result "c")) "")
+   `(feComposite ((in "c") (in2 "b") (operator "in") (result "glow")) "")
+   `(feMerge () (feMergeNode ((in "glow")) "") (feMergeNode ((in "SourceGraphic")) ""))))
+
+(define (shadow-filter dx dy amount color)
+  (filter-url
+   `(feDropShadow ((dx ,(fmt-num dx)) (dy ,(fmt-num dy)) (stdDeviation ,(fmt-num amount))
+                   (flood-color ,color) (flood-opacity "0.6")) "")))
 
 ;; Interpret one command into a list of SVG xexprs.  `env` carries constants /
 ;; the loop index / locals, `depth` bounds nesting, `ctx` bounds total output.
@@ -478,6 +585,32 @@
           (spend! ctx)
           (list (arc-xexpr (eval-num cx env) (eval-num cy env) (eval-num r env)
                            (eval-num a0 env) (eval-num a1 env) (col c) (eval-num w env)))]
+         [(list 'sector cx cy r a0 a1 c)
+          (spend! ctx)
+          (list (sector-xexpr (eval-num cx env) (eval-num cy env) (eval-num r env)
+                              (eval-num a0 env) (eval-num a1 env) (col c)))]
+         [(list 'spiral cx cy turns r0 r1 c w)
+          (spend! ctx)
+          (list (spiral-xexpr (eval-num cx env) (eval-num cy env) (eval-num turns env)
+                              (eval-num r0 env) (eval-num r1 env) (col c) (eval-num w env)))]
+         [(list* 'curve c w pts)
+          (spend! ctx)
+          (list (curve-xexpr pts env (col c) (eval-num w env)))]
+
+         ;; --- SVG filter effects (registered in <defs>, no JS) --------------
+         [(list* 'blur amount body)
+          (spend! ctx)
+          (define f (blur-filter (max 0 (min 40 (eval-num amount env)))))
+          (list `(g ((filter ,f)) ,@(run body env (add1 depth))))]
+         [(list* 'glow gc body)
+          (spend! ctx)
+          (define f (glow-filter (col gc) 4))
+          (list `(g ((filter ,f)) ,@(run body env (add1 depth))))]
+         [(list* 'shadow dx dy amount sc body)
+          (spend! ctx)
+          (define f (shadow-filter (eval-num dx env) (eval-num dy env)
+                                   (max 0 (min 40 (eval-num amount env))) (col sc)))
+          (list `(g ((filter ,f)) ,@(run body env (add1 depth))))]
 
          ;; --- gradients (register a <defs> entry + fill the canvas) ----------
          [(list* 'linear-bg angle colors)
@@ -1012,7 +1145,15 @@ ENDJS
    (list "Inimi" "grid + heart"
          "(linear-bg 90 \"#2a0a1a\" \"#0b0f1a\")\n(grid 8 5\n  (let ([x (+ 45 (* gx 72))] [y (+ 55 (* gy 80))])\n    (pulse (+ 1.5 (* gi 0.1))\n      (heart x y (+ 16 (* 4 (noise gx gy))) (hsl (* gi 9) 80 65)))))")
    (list "Raze" "bucla for"
-         "(radial-bg \"#10131f\" \"#05070f\")\n(for a 0 360 6\n  (line 300 200 (+ 300 (* 230 (cos (* a 0.0175)))) (+ 200 (* 230 (sin (* a 0.0175))))\n        (hsv a 85 95) 2))\n(circle 300 200 30 \"#f1fa8c\")")))
+         "(radial-bg \"#10131f\" \"#05070f\")\n(for a 0 360 6\n  (line 300 200 (+ 300 (* 230 (cos (* a 0.0175)))) (+ 200 (* 230 (sin (* a 0.0175))))\n        (hsv a 85 95) 2))\n(circle 300 200 30 \"#f1fa8c\")")
+   (list "Nebuloasa" "glow + palette"
+         "(bg \"#02030a\")\n(seed 11)\n(glow \"#00e5ff\"\n  (repeat 220\n    (let ([x (random 600)] [y (random 400)])\n      (circle x y (random 2 6) (palette \"neon\" (random 6))))))")
+   (list "Spirala" "spiral + glow"
+         "(radial-bg \"#0a0012\" \"#000\")\n(glow \"#ff2a6d\"\n  (spiral 300 200 6 4 180 (palette \"neon\" 0) 3))\n(spin 300 200 24\n  (spiral 300 200 6 6 170 \"#00e5ff\" 2))")
+   (list "Val" "curba neteda"
+         "(linear-bg 90 \"#031d2e\" \"#06374f\")\n(repeat 6\n  (let ([o (* i 14)])\n    (curve (palette \"ocean\" (+ i 1)) 3\n      0 (+ 200 o) 100 (+ 150 o) 200 (+ 230 o) 300 (+ 160 o)\n      400 (+ 240 o) 500 (+ 170 o) 600 (+ 210 o))))")
+   (list "Petale" "sector radial"
+         "(bg \"#0b0f1a\")\n(repeat 18\n  (rotate (* i 20) 300 200\n    (sector 300 200 160 -8 8 (hsv (* i 20) 75 95))))\n(glow \"#ffffff\" (circle 300 200 26 \"#fff3b0\"))")))
 
 (define (example-card title desc code)
   `(form ((method "post") (class "ex-form"))
@@ -1213,6 +1354,8 @@ ENDJS
                         "(polygon culoare x1 y1 ...)" "(polyline culoare gros x1 y1 ...)"
                         "(star cx cy varfuri rext rint c)"
                         "(poly cx cy laturi r c)" "(heart cx cy marime c)"
+                        "(sector cx cy r a0 a1 c)" "(spiral cx cy ture r0 r1 c gros)"
+                        "(curve c gros x1 y1 x2 y2 ...)"
                         "(text x y marime culoare STR)" "(bg culoare)"))
                ,(cheat-col "Control"
                   (list "(repeat N cmd...)" "i = index in repeat"
@@ -1222,7 +1365,8 @@ ENDJS
                   (list "(group cmd...)" "(rotate grd cx cy cmd...)"
                         "(translate dx dy cmd...)" "(scale sx sy cmd...)"
                         "(opacity a cmd...)" "(spin cx cy sec cmd...)"
-                        "(pulse sec cmd...)"))
+                        "(pulse sec cmd...)" "(blur px cmd...)"
+                        "(glow culoare cmd...)" "(shadow dx dy px c cmd...)"))
                ,(cheat-col "Numere"
                   (list "+  -  *  /  mod  pow" "sin cos tan atan atan2" "sqrt exp log abs sign"
                         "floor round ceil neg" "min max hypot dist" "(lerp a b t) (clamp x lo hi)"
@@ -1231,6 +1375,7 @@ ENDJS
                ,(cheat-col "Culori"
                   (list "#rrggbb" "nume-css (red...)" "(rgb r g b)" "(rgba r g b a)"
                         "(hsl h s l)" "(hsla h s l a)" "(hsv h s v)" "(mix c1 c2 t)"
+                        "(palette \"nume\" i)" "fire ocean neon pastel sunset forest"
                         "(linear-bg grd c1 c2 ...)" "(radial-bg c1 c2 ...)"))))
 
              (footer
@@ -1382,4 +1527,28 @@ ENDJS
 
   (test-case "theme-independent: light palette CSS and toggle are present"
     (check-true (regexp-match? #px"data-theme=light" PAGE-CSS))
-    (check-true (regexp-match? #px"btnTheme" PAGE-JS))))
+    (check-true (regexp-match? #px"btnTheme" PAGE-JS)))
+
+  ;; --- round 3: palettes, effects, curve/spiral/sector -----------------------
+  (test-case "palette returns a curated hex, unknown name falls back"
+    (check-equal? (palette-color "fire" 0) "#2b0a00")
+    (check-equal? (palette-color "fire" 6) "#2b0a00") ; wraps
+    (check-equal? (palette-color "nope" 0) "#888888")
+    (define s (svg->str (parse-to-svg "(circle 1 1 1 (palette \"neon\" 2))")))
+    (check-true (regexp-match? #px"#[0-9a-fA-F]{6}" s)))
+
+  (test-case "effects register SVG filters and wrap children (no JS)"
+    (define s (svg->str (parse-to-svg "(blur 3 (circle 1 1 1 \"red\"))(glow \"cyan\" (circle 2 2 2 \"red\"))(shadow 2 2 2 \"black\" (rect 0 0 5 5 \"red\"))")))
+    (check-true (regexp-match? #px"<filter" s))
+    (check-true (regexp-match? #px"feGaussianBlur" s))
+    (check-true (regexp-match? #px"feDropShadow" s))
+    (check-true (regexp-match? #px"filter=\"url\\(#" s)))
+
+  (test-case "curve/spiral/sector emit paths and are bounded"
+    (define s (svg->str (parse-to-svg "(curve \"red\" 2 0 0 50 50 100 0 150 50)(spiral 300 200 5 2 100 \"cyan\" 2)(sector 300 200 100 0 90 \"lime\")")))
+    (check-equal? (length (regexp-match* #px"<path" s)) 3)
+    (check-not-exn (lambda () (parse-to-svg "(spiral 300 200 30 0 1000 \"red\" 2)"))))
+
+  (test-case "effect filters still obey the element budget"
+    (define svg (parse-to-svg (string-append "(repeat 9000 (glow \"red\" (circle 1 1 1 \"red\")))")))
+    (check-true (< (count-nodes svg) 60000))))
