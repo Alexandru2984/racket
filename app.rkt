@@ -109,10 +109,48 @@
         [(list 'neg a)               (- (ev a))]
         [(list 'floor a)             (floor (ev a))]
         [(list 'round a)             (round (ev a))]
+        [(list 'ceil a)              (ceiling (ev a))]
+        [(list 'sign a)              (let ([x (ev a)]) (cond [(> x 0) 1] [(< x 0) -1] [else 0]))]
+        [(list 'exp a)               (exp (min 30 (ev a)))]           ; clamp-num caps the result
+        [(list 'log a)               (let ([x (ev a)]) (if (<= x 0) 0 (log x)))]
+        [(list 'atan a)              (atan (ev a))]
+        [(list 'atan2 a b)           (atan (ev a) (ev b))]
+        [(list 'hypot a b)           (let ([x (ev a)] [y (ev b)]) (sqrt (+ (* x x) (* y y))))]
+        [(list 'dist a b c d)        (let ([dx (- (ev c) (ev a))] [dy (- (ev d) (ev b))])
+                                       (sqrt (+ (* dx dx) (* dy dy))))]
+        [(list 'lerp a b t)          (let ([x (ev a)] [y (ev b)] [u (ev t)]) (+ x (* (- y x) u)))]
+        [(list 'clamp a lo hi)       (let ([x (ev a)] [l (ev lo)] [h (ev hi)]) (max (min l h) (min (max l h) x)))]
+        ;; (map v in-lo in-hi out-lo out-hi): remap v from one range to another.
+        [(list 'map v il ih ol oh)   (let ([x (ev v)] [a (ev il)] [b (ev ih)] [c (ev ol)] [d (ev oh)])
+                                       (if (= a b) c (+ c (* (/ (- x a) (- b a)) (- d c)))))]
+        [(list 'noise a)             (value-noise (ev a) 0.0)]
+        [(list 'noise a b)           (value-noise (ev a) (ev b))]
+        [(list 'noise a b c)         (value-noise (+ (ev a) (* 131.0 (ev c))) (ev b))]
         [(cons 'min (and args (cons _ _))) (apply min (map ev args))]
         [(cons 'max (and args (cons _ _))) (apply max (map ev args))]
         [_ 0]))]
     [else 0]))
+
+;; ---------------------------------------------------------------------------
+;; Value noise — deterministic, smooth pseudo-random field in [0,1], the
+;; backbone of organic procedural art (terrain, clouds, flow fields).  Pure
+;; integer hashing + smoothstep bilinear interpolation: O(1), no state, fully
+;; reproducible for a given seed.
+;; ---------------------------------------------------------------------------
+(define (hash-01 ix iy)
+  (define n (bitwise-and (+ (* ix 374761393) (* iy 668265263)) #xffffffff))
+  (define m (bitwise-and (* (bitwise-xor n (arithmetic-shift n -13)) 1274126177) #xffffffff))
+  (/ (exact->inexact (bitwise-and (bitwise-xor m (arithmetic-shift m -16)) #xffffff)) 16777215.0))
+
+(define (value-noise x y)
+  (define (smooth t) (* t t (- 3.0 (* 2.0 t))))
+  (define x0 (floor x)) (define y0 (floor y))
+  (define ix (inexact->exact x0)) (define iy (inexact->exact y0))
+  (define ux (smooth (- x x0))) (define uy (smooth (- y y0)))
+  (define a (hash-01 ix iy))            (define b (hash-01 (add1 ix) iy))
+  (define c (hash-01 ix (add1 iy)))     (define d (hash-01 (add1 ix) (add1 iy)))
+  (+ (* a (- 1.0 ux) (- 1.0 uy)) (* b ux (- 1.0 uy))
+     (* c (- 1.0 ux) uy)         (* d ux uy)))
 
 ;; ---------------------------------------------------------------------------
 ;; Colors — validated against a conservative whitelist.  xexpr->string already
@@ -140,7 +178,65 @@
     [(list 'rgba r g b a)   (format "rgba(~a,~a,~a,~a)"    (clamp-255 (ev r)) (clamp-255 (ev g)) (clamp-255 (ev b)) (clamp-unit (ev a)))]
     [(list 'hsl h s l)      (format "hsl(~a,~a%,~a%)"      (clamp-360 (ev h)) (clamp-pct (ev s)) (clamp-pct (ev l)))]
     [(list 'hsla h s l a)   (format "hsla(~a,~a%,~a%,~a)"  (clamp-360 (ev h)) (clamp-pct (ev s)) (clamp-pct (ev l)) (clamp-unit (ev a)))]
+    ;; (mix c1 c2 t): linear RGB interpolation between any two colors at t in
+    ;; [0,1] — smooth gradients across a loop without SVG <defs>.
+    [(list 'mix c1 c2 t)    (match-define (list r g b) (mix-rgb c1 c2 (ev t) env)) (format "rgb(~a,~a,~a)" r g b)]
     [_ fallback]))
+
+;; --- color -> (r g b) for interpolation --------------------------------------
+;; A small table of the CSS names worth interpolating; any other name falls
+;; back to mid-gray (it still renders fine as a literal via eval-color).
+(define CSS-NAMED
+  (hash "black" '(0 0 0) "white" '(255 255 255) "red" '(255 0 0) "lime" '(0 255 0)
+        "green" '(0 128 0) "blue" '(0 0 255) "yellow" '(255 255 0) "cyan" '(0 255 255)
+        "magenta" '(255 0 255) "orange" '(255 165 0) "purple" '(128 0 128)
+        "pink" '(255 192 203) "gray" '(128 128 128) "grey" '(128 128 128)
+        "navy" '(0 0 128) "teal" '(0 128 128) "gold" '(255 215 0) "tomato" '(255 99 71)
+        "coral" '(255 127 80) "indigo" '(75 0 130) "violet" '(238 130 238)))
+
+(define (hex->rgb s)
+  (define h (substring s 1))
+  (define (pair i) (string->number (substring h i (+ i 2)) 16))
+  (define (dup i) (let ([v (string->number (substring h i (+ i 1)) 16)]) (and v (+ (* v 16) v))))
+  (cond [(= (string-length h) 3) (map (lambda (i) (or (dup i) 0)) '(0 1 2))]
+        [(>= (string-length h) 6) (map (lambda (i) (or (pair i) 0)) '(0 2 4))]
+        [else '(128 128 128)]))
+
+(define (hsl->rgb h s l)
+  (define hh (/ (modulo (inexact->exact (round h)) 360) 360.0))
+  (define ss (/ (max 0.0 (min 100.0 (exact->inexact s))) 100.0))
+  (define ll (/ (max 0.0 (min 100.0 (exact->inexact l))) 100.0))
+  (define (hue->c p q t0)
+    (define t (cond [(< t0 0) (+ t0 1)] [(> t0 1) (- t0 1)] [else t0]))
+    (cond [(< t (/ 1.0 6)) (+ p (* (- q p) 6 t))]
+          [(< t 0.5) q]
+          [(< t (/ 2.0 3)) (+ p (* (- q p) (- (/ 2.0 3) t) 6))]
+          [else p]))
+  (cond [(= ss 0) (list (clamp-255 (* ll 255)) (clamp-255 (* ll 255)) (clamp-255 (* ll 255)))]
+        [else (define q (if (< ll 0.5) (* ll (+ 1 ss)) (- (+ ll ss) (* ll ss))))
+              (define p (- (* 2 ll) q))
+              (list (clamp-255 (* 255 (hue->c p q (+ hh (/ 1.0 3)))))
+                    (clamp-255 (* 255 (hue->c p q hh)))
+                    (clamp-255 (* 255 (hue->c p q (- hh (/ 1.0 3))))))]))
+
+(define (color->rgb c env)
+  (define (ev x) (eval-num x env))
+  (match c
+    [(list 'rgb r g b)     (list (clamp-255 (ev r)) (clamp-255 (ev g)) (clamp-255 (ev b)))]
+    [(list 'rgba r g b _)  (list (clamp-255 (ev r)) (clamp-255 (ev g)) (clamp-255 (ev b)))]
+    [(list 'hsl h s l)     (hsl->rgb (ev h) (ev s) (ev l))]
+    [(list 'hsla h s l _)  (hsl->rgb (ev h) (ev s) (ev l))]
+    [(list 'mix c1 c2 t)   (mix-rgb c1 c2 (ev t) env)]
+    [(? string?) (let ([s (string-downcase (string-trim c))])
+                   (cond [(regexp-match? #px"^#[0-9a-fA-F]{3,8}$" s) (hex->rgb s)]
+                         [(hash-ref CSS-NAMED s #f) => values]
+                         [else '(128 128 128)]))]
+    [_ '(128 128 128)]))
+
+(define (mix-rgb c1 c2 t env)
+  (define u (max 0.0 (min 1.0 (exact->inexact t))))
+  (for/list ([a (in-list (color->rgb c1 env))] [b (in-list (color->rgb c2 env))])
+    (clamp-255 (+ a (* (- b a) u)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Render context: a shared, mutable budget so total emitted nodes are capped
@@ -150,8 +246,10 @@
 ;;   fuel   — raw work units still allowed    (caps CPU regardless of shapes)
 ;;   points — polygon/polyline/star vertices  (caps output size)
 ;;   errors — error nodes already emitted     (caps error-node spam)
-(struct rctx (budget fuel points errors) #:mutable)
-(define (make-rctx) (rctx MAX-ELEMENTS MAX-FUEL MAX-TOTAL-POINTS 0))
+;;   defs   — accumulated <defs> children (gradients), newest first
+;;   gid    — monotonic id counter for generated gradient ids
+(struct rctx (budget fuel points errors defs gid) #:mutable)
+(define (make-rctx) (rctx MAX-ELEMENTS MAX-FUEL MAX-TOTAL-POINTS 0 '() 0))
 
 ;; A parameter holding the live context, so the numeric evaluator and the
 ;; geometry helpers can charge the shared budget without threading ctx through
@@ -176,6 +274,15 @@
   (define c (current-ctx))
   (and (> (rctx-points c) 0)
        (begin (set-rctx-points! c (sub1 (rctx-points c))) #t)))
+
+;; Register a <defs> child (a gradient) and return the generated id to
+;; reference it with fill="url(#id)".  Bounded by the element budget.
+(define (add-def! make-node)
+  (define c (current-ctx))
+  (define id (format "g~a" (rctx-gid c)))
+  (set-rctx-gid! c (add1 (rctx-gid c)))
+  (set-rctx-defs! c (cons (make-node id) (rctx-defs c)))
+  id)
 
 (define (short-str s)
   (define str (format "~a" s))
@@ -227,6 +334,37 @@
       (format "~a,~a" (fmt-num (+ cx (* r (cos ang)))) (fmt-num (+ cy (* r (sin ang)))))))
   `(polygon ((points ,(string-join pts " ")) (fill ,fill)) ""))
 
+;; Stroked circular arc from angle a0 to a1 (degrees) as an SVG <path>.
+(define (arc-xexpr cx cy r a0 a1 stroke width)
+  (define rr (abs r))
+  (define r0 (degrees->radians a0)) (define r1 (degrees->radians a1))
+  (define x0 (+ cx (* rr (cos r0)))) (define y0 (+ cy (* rr (sin r0))))
+  (define x1 (+ cx (* rr (cos r1)))) (define y1 (+ cy (* rr (sin r1))))
+  (define large (if (> (abs (- a1 a0)) 180) 1 0))
+  (define sweep (if (>= a1 a0) 1 0))
+  `(path ((d ,(format "M ~a ~a A ~a ~a 0 ~a ~a ~a ~a"
+                      (fmt-num x0) (fmt-num y0) (fmt-num rr) (fmt-num rr)
+                      large sweep (fmt-num x1) (fmt-num y1)))
+          (fill "none") (stroke ,stroke) (stroke-width ,(fmt-num width))
+          (stroke-linecap "round"))
+         ""))
+
+;; Build a gradient <defs> node (linear or radial) with evenly spaced stops
+;; from a list of color strings, and return its url(#id) reference.
+(define (gradient-url kind colors env [extra '()])
+  (define stops
+    (for/list ([c (in-list colors)] [k (in-naturals)])
+      (define off (if (= (length colors) 1) 0
+                      (exact->inexact (/ k (sub1 (length colors))))))
+      `(stop ((offset ,(string-append (~r (* 100 off) #:precision 1) "%")) (stop-color ,(eval-color c env))) "")))
+  (define id
+    (add-def!
+     (lambda (gid)
+       (if (eq? kind 'linear)
+           `(linearGradient ((id ,gid) ,@extra) ,@stops)
+           `(radialGradient ((id ,gid) ,@extra) ,@stops)))))
+  (format "url(#~a)" id))
+
 ;; Interpret one command into a list of SVG xexprs.  `env` carries constants /
 ;; the loop index / locals, `depth` bounds nesting, `ctx` bounds total output.
 ;; Every path is guarded so malformed or hostile input degrades to a small
@@ -242,6 +380,15 @@
      (with-handlers ([exn:fail? (lambda (e) (note-error! ctx "Eroare interpretare" (exn-message e) 24))])
        (define (n v) (fmt-num (eval-num v env)))
        (define (col c) (eval-color c env))
+       ;; Run a body of commands in env e at depth d, honoring the live budget.
+       (define (run body e d)
+         (apply append (for/list ([b (in-list body)] #:break (not (alive? ctx)))
+                         (interpret b e ctx d))))
+       ;; Emit a <g transform=...> wrapper around a body (shared by the
+       ;; transform commands); costs one element for the group itself.
+       (define (wrap-g transform body)
+         (spend! ctx)
+         (list `(g ((transform ,transform)) ,@(run body env (add1 depth)))))
        (match cmd
          [(list 'circle cx cy r c)
           (spend! ctx)
@@ -275,6 +422,63 @@
           (spend! ctx)
           (list (star-xexpr (eval-num cx env) (eval-num cy env) (eval-num spikes env)
                             (eval-num outer env) (eval-num inner env) (col c)))]
+         [(list 'triangle x1 y1 x2 y2 x3 y3 c)
+          (spend! ctx)
+          (list `(polygon ((points ,(points->str (list x1 y1 x2 y2 x3 y3) env)) (fill ,(col c))) ""))]
+         [(list 'ring cx cy r c w)
+          (spend! ctx)
+          (list `(circle ((cx ,(n cx)) (cy ,(n cy)) (r ,(n r)) (fill "none")
+                          (stroke ,(col c)) (stroke-width ,(n w))) ""))]
+         [(list 'arc cx cy r a0 a1 c w)
+          (spend! ctx)
+          (list (arc-xexpr (eval-num cx env) (eval-num cy env) (eval-num r env)
+                           (eval-num a0 env) (eval-num a1 env) (col c) (eval-num w env)))]
+
+         ;; --- gradients (register a <defs> entry + fill the canvas) ----------
+         [(list* 'linear-bg angle colors)
+          (spend! ctx)
+          (define cs (if (null? colors) (list "#000" "#fff") colors))
+          (define url (gradient-url 'linear cs env
+                                    (list `(gradientTransform
+                                            ,(format "rotate(~a 0.5 0.5)" (fmt-num (eval-num angle env)))))))
+          (list `(rect ((x "0") (y "0") (width "600") (height "400") (fill ,url)) ""))]
+         [(list* 'radial-bg colors)
+          (spend! ctx)
+          (define cs (if (null? colors) (list "#fff" "#000") colors))
+          (list `(rect ((x "0") (y "0") (width "600") (height "400")
+                        (fill ,(gradient-url 'radial cs env))) ""))]
+
+         ;; --- transforms / grouping -----------------------------------------
+         [(list* 'group body)             (wrap-g "translate(0,0)" body)]
+         [(list* 'rotate deg cx cy body)  (wrap-g (format "rotate(~a ~a ~a)" (n deg) (n cx) (n cy)) body)]
+         [(list* 'translate dx dy body)   (wrap-g (format "translate(~a ~a)" (n dx) (n dy)) body)]
+         [(list* 'scale sx sy body)       (wrap-g (format "scale(~a ~a)" (n sx) (n sy)) body)]
+         [(list* 'opacity a body)
+          (spend! ctx)
+          (list `(g ((opacity ,(clamp-unit (eval-num a env)))) ,@(run body env (add1 depth))))]
+
+         ;; --- SVG-native animation (works in the page and the downloaded file)
+         [(list* 'spin cx cy dur body)
+          (spend! ctx)
+          (define d (max 0.2 (min 120 (eval-num dur env))))
+          (define cxs (n cx)) (define cys (n cy))
+          (list `(g () (animateTransform ((attributeName "transform") (attributeType "XML")
+                          (type "rotate") (from ,(format "0 ~a ~a" cxs cys))
+                          (to ,(format "360 ~a ~a" cxs cys))
+                          (dur ,(format "~as" (~r d #:precision 2))) (repeatCount "indefinite")) "")
+                   ,@(run body env (add1 depth))))]
+         [(list* 'pulse dur body)
+          (spend! ctx)
+          (define d (max 0.2 (min 120 (eval-num dur env))))
+          (list `(g () (animate ((attributeName "opacity") (values "1;0.35;1")
+                          (dur ,(format "~as" (~r d #:precision 2))) (repeatCount "indefinite")) "")
+                   ,@(run body env (add1 depth))))]
+
+         ;; --- reproducible randomness ---------------------------------------
+         [(list 'seed s)
+          (random-seed (max 1 (modulo (abs (inexact->exact (floor (eval-num s env)))) 2147483646)))
+          '()]
+
          [(cons 'let (cons bindings body))
           (define env*
             (if (list? bindings)
@@ -330,7 +534,10 @@
                     [exn:fail?          (lambda (_) (values '() #t))])
       (call-with-limits RENDER-TIME-SEC RENDER-MEM-MB
         (lambda ()
-          (parameterize ([current-ctx ctx])
+          ;; A fresh PRG per render so (seed N) is reproducible and isolated
+          ;; between requests.
+          (parameterize ([current-ctx ctx]
+                         [current-pseudo-random-generator (make-pseudo-random-generator)])
             (define els
               (if (list? forms)
                   (apply append
@@ -338,6 +545,9 @@
                            (interpret c BASE-ENV ctx 0)))
                   '()))
             (values els #f))))))
+  ;; Gradients registered during interpretation go into a <defs> block first.
+  (define defs (rctx-defs ctx))
+  (define defs-node (if (null? defs) '() (list `(defs () ,@(reverse defs)))))
   (define notice
     (if (or limited? (<= (rctx-budget ctx) 0) (<= (rctx-fuel ctx) 0) (<= (rctx-points ctx) 0))
         (list `(text ((x "12") (y "392") (fill "#ffb86c") (font-family "monospace") (font-size "12"))
@@ -351,7 +561,7 @@
          (width "600") (height "400")
          (preserveAspectRatio "xMidYMid meet")
          (style "background:#000;border-radius:12px;display:block;width:100%;height:auto;"))
-        ,@elements ,@notice))
+        ,@defs-node ,@elements ,@notice))
 
 ;; ---------------------------------------------------------------------------
 ;; Image -> DSL.  Bounded on every axis: output resolution is capped (so a
@@ -405,16 +615,17 @@
 
 (define DEFAULT-CODE
   (string-append
-   ";; Foloseste (i) = indexul buclei, trigonometrie si culori hsl calculate.\n"
-   "(bg \"#0b0f1a\")\n\n"
-   ";; Un vartej de cercuri colorate\n"
-   "(repeat 90\n"
-   "  (circle (+ 300 (* (* i 2.2) (cos (* i 0.35))))\n"
-   "          (+ 200 (* (* i 2.2) (sin (* i 0.35))))\n"
-   "          6\n"
-   "          (hsl (* i 5) 85 60)))\n\n"
-   ";; O stea in centru\n"
-   "(star 300 200 5 40 16 \"#f1fa8c\")"))
+   ";; (i) = indexul buclei. Incearca: noise, mix, gradient, spin, seed.\n"
+   "(linear-bg 60 \"#0b0f1a\" \"#1a1030\" \"#0b0f1a\")\n\n"
+   ";; Un vartej care se roteste (animatie SVG nativa)\n"
+   "(spin 300 200 32\n"
+   "  (repeat 90\n"
+   "    (circle (+ 300 (* (* i 2.2) (cos (* i 0.35))))\n"
+   "            (+ 200 (* (* i 2.2) (sin (* i 0.35))))\n"
+   "            6\n"
+   "            (mix \"#8be9fd\" \"#ff79c6\" (noise i 2)))))\n\n"
+   ";; O stea care pulseaza in centru\n"
+   "(pulse 3 (star 300 200 5 40 16 \"#f1fa8c\"))"))
 
 ;; ---------------------------------------------------------------------------
 ;; UI: mobile-first responsive page.  The app is server-rendered and fully
@@ -474,7 +685,7 @@ border-radius:var(--radius);padding:.6rem 1.1rem}
 details.cheat>summary{cursor:pointer;font-weight:700;color:var(--text);padding:.5rem 0}
 .cheat-grid{display:grid;gap:1rem;grid-template-columns:1fr;margin-top:.5rem}
 @media(min-width:640px){.cheat-grid{grid-template-columns:1fr 1fr}}
-@media(min-width:1000px){.cheat-grid{grid-template-columns:repeat(4,1fr)}}
+@media(min-width:1000px){.cheat-grid{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}}
 .cheat-grid h3{color:var(--cyan);font-size:.78rem;text-transform:uppercase;letter-spacing:.05em;margin:.1rem 0 .5rem}
 .cheat-grid ul{list-style:none;margin:0;padding:0}.cheat-grid li{margin:.35rem 0}
 code{background:#0b0e17;border:1px solid var(--border);padding:.14rem .42rem;border-radius:6px;
@@ -518,7 +729,15 @@ box-shadow:0 10px 30px rgba(0,0,0,.4);transition:transform .25s;z-index:50}
    (list "Grila" "repeat imbricat"
          "(bg \"#0e1017\")\n(repeat 10\n  (let ([col i])\n    (repeat 7\n      (star (+ 40 (* col 58)) (+ 40 (* i 55)) 5 18 8 (hsl (* (+ (* col 7) i) 8) 78 62)))))")
    (list "Unda" "sinusoida"
-         "(bg \"#0b0f1a\")\n(repeat 60\n  (circle (* i 10) (+ 200 (* 120 (sin (* i 0.3)))) 6 (hsl (* i 6) 85 60)))")))
+         "(bg \"#0b0f1a\")\n(repeat 60\n  (circle (* i 10) (+ 200 (* 120 (sin (* i 0.3)))) 6 (hsl (* i 6) 85 60)))")
+   (list "Camp de flux" "noise organic"
+         "(linear-bg 90 \"#05070f\" \"#0f1630\")\n(seed 7)\n(repeat 1400\n  (let ([x (random 600)] [y (random 400)]\n        [a (* 6.28 (noise (* x 0.012) (* y 0.012)))])\n    (line x y (+ x (* 14 (cos a))) (+ y (* 14 (sin a)))\n          (mix \"#8be9fd\" \"#bd93f9\" (noise (* x 0.02) (* y 0.02))) 1.5)))")
+   (list "Soare" "gradient radial"
+         "(radial-bg \"#fff3b0\" \"#ff8c42\" \"#b23a48\" \"#0b0f1a\")\n(spin 300 200 60\n  (repeat 36\n    (line 300 200 (+ 300 (* 260 (cos (* i 0.1745)))) (+ 200 (* 260 (sin (* i 0.1745))))\n          (rgba 255 240 180 0.5) 2)))\n(circle 300 200 70 \"#fff3b0\")")
+   (list "Caleidoscop" "rotate + repeat"
+         "(bg \"#0a0a12\")\n(repeat 12\n  (rotate (* i 30) 300 200\n    (repeat 10\n      (let ([r (* i 4)])\n        (circle (+ 300 (* (* i 10) (cos (* i 0.5)))) 200 (+ 3 r)\n                (hsla (* i 20) 80 60 0.7))))))")
+   (list "Spirala animata" "spin + stele"
+         "(linear-bg 45 \"#1a0b2e\" \"#0b0f1a\")\n(spin 300 200 24\n  (repeat 40\n    (let ([a (* i 0.5)] [r (* i 6)])\n      (star (+ 300 (* r (cos a))) (+ 200 (* r (sin a))) 5 8 3\n            (mix \"#f1fa8c\" \"#ff79c6\" (map i 0 40 0 1))))))")))
 
 (define (example-card title desc code)
   `(form ((method "post") (class "ex-form"))
@@ -633,18 +852,28 @@ box-shadow:0 10px 30px rgba(0,0,0,.4);transition:transform .25s;z-index:50}
                ,(cheat-col "Forme"
                   (list "(circle x y r culoare)" "(rect x y w h culoare)"
                         "(ellipse cx cy rx ry culoare)" "(line x1 y1 x2 y2 culoare gros)"
+                        "(ring cx cy r culoare gros)" "(arc cx cy r a0 a1 culoare gros)"
+                        "(triangle x1 y1 x2 y2 x3 y3 c)"
                         "(polygon culoare x1 y1 ...)" "(polyline culoare gros x1 y1 ...)"
-                        "(star cx cy varfuri rext rint culoare)"
+                        "(star cx cy varfuri rext rint c)"
                         "(text x y marime culoare STR)" "(bg culoare)"))
                ,(cheat-col "Control"
                   (list "(repeat N cmd...)" "i = index in repeat"
-                        "(let ([nume val] ...) cmd...)"))
+                        "(let ([nume val] ...) cmd...)" "(seed N) → random reproductibil"))
+               ,(cheat-col "Transform / Animatie"
+                  (list "(group cmd...)" "(rotate grd cx cy cmd...)"
+                        "(translate dx dy cmd...)" "(scale sx sy cmd...)"
+                        "(opacity a cmd...)" "(spin cx cy sec cmd...)"
+                        "(pulse sec cmd...)"))
                ,(cheat-col "Numere"
-                  (list "+  -  *  /  mod  pow" "sin cos tan sqrt" "abs neg floor round"
-                        "min max" "(random max)" "(random lo hi)" "pi tau width height"))
+                  (list "+  -  *  /  mod  pow" "sin cos tan atan atan2" "sqrt exp log abs sign"
+                        "floor round ceil neg" "min max hypot dist" "(lerp a b t) (clamp x lo hi)"
+                        "(map v il ih ol oh)" "(noise x y) → 0..1"
+                        "(random max) (random lo hi)" "pi tau width height"))
                ,(cheat-col "Culori"
                   (list "#rrggbb" "nume-css (red...)" "(rgb r g b)" "(rgba r g b a)"
-                        "(hsl h s l)" "(hsla h s l a)"))))
+                        "(hsl h s l)" "(hsla h s l a)" "(mix c1 c2 t)"
+                        "(linear-bg grd c1 c2 ...)" "(radial-bg c1 c2 ...)"))))
 
              (footer
               (p "Procedural Canvas DSL · scris in Racket cu web-server · "
@@ -723,4 +952,50 @@ box-shadow:0 10px 30px rgba(0,0,0,.4);transition:transform .25s;z-index:50}
 
   (test-case "cyclic / reader payloads are rejected by the reader"
     (check-not-exn (lambda () (parse-to-svg "#0=(1 . #0#)")))
-    (check-not-exn (lambda () (parse-to-svg "#lang racket")))))
+    (check-not-exn (lambda () (parse-to-svg "#lang racket"))))
+
+  ;; --- DSL feature coverage --------------------------------------------------
+  (define (svg->str x) (xexpr->string x))
+
+  (test-case "value-noise is in [0,1] and smooth/deterministic"
+    (for ([i (in-range 200)])
+      (define v (value-noise (* i 0.37) (* i 0.11)))
+      (check-true (and (>= v 0.0) (<= v 1.0))))
+    (check-= (value-noise 3.5 2.25) (value-noise 3.5 2.25) 0.0))
+
+  (test-case "new math ops evaluate"
+    (check-not-exn (lambda ()
+      (parse-to-svg "(circle (map i 0 10 0 600) (clamp (lerp 0 400 0.5) 0 400) (hypot 3 4) \"red\")"))))
+
+  (test-case "mix produces a valid rgb() color"
+    (define s (svg->str (parse-to-svg "(circle 1 1 1 (mix \"#ff0000\" \"#0000ff\" 0.5))")))
+    (check-true (regexp-match? #px"rgb\\(12[78],0,12[78]\\)" s)))
+
+  (test-case "gradients register a <defs> block"
+    (define s (svg->str (parse-to-svg "(linear-bg 45 \"#000\" \"#fff\")(radial-bg \"red\" \"blue\")")))
+    (check-true (regexp-match? #px"<defs>" s))
+    (check-true (regexp-match? #px"linearGradient" s))
+    (check-true (regexp-match? #px"radialGradient" s))
+    (check-true (regexp-match? #px"url\\(#g" s)))
+
+  (test-case "transforms wrap children in a <g transform=...>"
+    (define s (svg->str (parse-to-svg "(rotate 30 300 200 (rect 0 0 10 10 \"red\"))")))
+    (check-true (regexp-match? #px"<g transform=\"rotate\\(30 300 200\\)\">" s)))
+
+  (test-case "animation emits SVG-native animate nodes (no JS)"
+    (define s (svg->str (parse-to-svg "(spin 300 200 8 (rect 0 0 10 10 \"red\"))(pulse 2 (circle 1 1 1 \"red\"))")))
+    (check-true (regexp-match? #px"animateTransform" s))
+    (check-true (regexp-match? #px"<animate " s)))
+
+  (test-case "seed makes randomness reproducible"
+    (define a (svg->str (parse-to-svg "(seed 7)(repeat 20 (circle (random 600) (random 400) 3 \"red\"))")))
+    (define b (svg->str (parse-to-svg "(seed 7)(repeat 20 (circle (random 600) (random 400) 3 \"red\"))")))
+    (check-equal? a b)
+    (define c (svg->str (parse-to-svg "(seed 8)(repeat 20 (circle (random 600) (random 400) 3 \"red\"))")))
+    (check-not-equal? a c))
+
+  (test-case "arc/ring/triangle render as expected shapes"
+    (define s (svg->str (parse-to-svg "(arc 300 200 100 0 90 \"red\" 3)(ring 100 100 40 \"cyan\" 2)(triangle 0 0 10 0 5 10 \"lime\")")))
+    (check-true (regexp-match? #px"<path" s))
+    (check-true (regexp-match? #px"fill=\"none\"" s))
+    (check-true (regexp-match? #px"<polygon" s))))
