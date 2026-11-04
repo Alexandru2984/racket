@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: racket-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Compile, test and smoke-check (Racket)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Racket (full distribution, includes draw-lib + web-server)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends racket
+          racket --version
+
+      - name: Compile
+        run: raco make app.rkt
+
+      - name: Resource-cap and DSL regression suite
+        run: raco test app.rkt
+
+      - name: Smoke test (boot + every route, incl. racket/draw OG image)
+        run: |
+          set -euo pipefail
+          RACKET_APP_PORT=8999 racket app.rkt &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8999/health >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS -o /dev/null -w 'home     %{http_code}\n'          http://127.0.0.1:8999/
+          curl -fsS -o /dev/null -w 'app.js   %{http_code} %{content_type}\n' http://127.0.0.1:8999/app.js
+          curl -fsS -o /dev/null -w 'og.png   %{http_code} %{content_type}\n' http://127.0.0.1:8999/og.png
+          curl -fsS -o /dev/null -w 'sitemap  %{http_code}\n'          http://127.0.0.1:8999/sitemap.xml
+          # API render returns an SVG for posted DSL code
+          curl -fsS -X POST --data 'code=(bg "#000")(circle 300 200 40 "red")' \
+            http://127.0.0.1:8999/api/render | grep -q '<svg'
+          echo "smoke OK"
+
+  static-checks:
+    name: Workflow and front-end JS checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Racket
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends racket
+
+      - name: Validate the served front-end script with Node
+        run: |
+          set -euo pipefail
+          RACKET_APP_PORT=8998 racket app.rkt &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8998/health >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8998/app.js -o app.js
+          node --check app.js
+          echo "app.js syntax OK"
