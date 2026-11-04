@@ -4,6 +4,7 @@
          web-server/http/bindings
          net/url
          net/base64
+         file/sha1
          racket/draw
          racket/math
          racket/sandbox
@@ -980,6 +981,10 @@ box-shadow:0 10px 30px rgba(0,0,0,.4);transition:transform .25s;z-index:50}
 ENDJS
 )
 
+;; Content hash of the script, used to cache-bust /app.js?v=... so a deploy is
+;; picked up immediately instead of waiting for the CDN/browser cache to expire.
+(define APP-JS-VER (substring (sha1 (open-input-bytes (string->bytes/utf-8 PAGE-JS))) 0 10))
+
 ;; Preset programs — each is a plain POST form, so they work without JS.
 (define EXAMPLES
   (list
@@ -1058,8 +1063,9 @@ ENDJS
 
     ;; Front-end script, served from same origin (CSP script-src 'self').
     [(equal? (req-path req) "app.js")
+     ;; Versioned via ?v=<hash> in the page, so this can cache hard.
      (response/full 200 #"OK" (current-seconds) #"application/javascript; charset=utf-8"
-                    (list (make-header #"Cache-Control" #"public, max-age=3600"))
+                    (list (make-header #"Cache-Control" #"public, max-age=604800, immutable"))
                     (list (string->bytes/utf-8 PAGE-JS)))]
 
     ;; Live-preview API: POST code -> SVG, with render stats in headers.  Same
@@ -1231,7 +1237,7 @@ ENDJS
               (p "Procedural Canvas DSL · scris in Racket cu web-server · "
                  (a ((href "https://github.com/Alexandru2984/racket") (target "_blank") (rel "noopener")) "cod sursa"))))
             (div ((id "toast") (class "toast")) "")
-            (script ((src "/app.js") (defer "defer"))))))])]))
+            (script ((src ,(string-append "/app.js?v=" APP-JS-VER)) (defer "defer"))))))])]))
 
 ;; The server only starts when this file is *run* (`racket app.rkt` executes the
 ;; `main` submodule).  Requiring the module — e.g. from the test submodule — runs
