@@ -2,9 +2,11 @@
 (require web-server/servlet
          web-server/servlet-env
          web-server/http/bindings
+         web-server/http/redirect
          net/url
          net/base64
          file/sha1
+         db
          racket/draw
          racket/math
          racket/sandbox
@@ -829,6 +831,17 @@
          (let ([txt (bytes->string* (base64-decode (string->bytes/utf-8 s)))])
            (and (non-empty-string? txt) (clip-code txt))))))
 
+;; Encode code into a ?c= permalink value (base64 + percent-encoding of +,/,=).
+(define (encode-share code)
+  (define b (bytes->string/utf-8 (base64-encode (string->bytes/utf-8 code) #"")))
+  (string-replace (string-replace (string-replace b "+" "%2B") "/" "%2F") "=" "%3D"))
+
+;; Client IP as set by nginx (X-Real-IP); used only for per-IP save throttling.
+(define (req-ip req)
+  (with-handlers ([exn:fail? (lambda (_) "?")])
+    (define h (headers-assq* #"X-Real-IP" (request-headers/raw req)))
+    (if h (bytes->string* (header-value h)) "?")))
+
 ;; ---------------------------------------------------------------------------
 ;; Social share image (Open Graph / Twitter).  Rendered once with racket/draw
 ;; to a real PNG — SVG OG images are poorly supported by scrapers — and cached.
@@ -880,6 +893,104 @@
          (for/fold ([acc 1]) ([c (in-list (cddr x))]) (+ acc (count-svg-nodes c)))]
         [(list? x) (for/fold ([acc 0]) ([c (in-list x)]) (+ acc (count-svg-nodes c)))]
         [else 0]))
+
+;; ---------------------------------------------------------------------------
+;; Community gallery — a public, unauthenticated store of saved creations, so
+;; every write is treated as hostile.  Bounded on every axis: a ring buffer
+;; caps row count (so disk is bounded), per-entry size caps, a per-IP cooldown,
+;; and a minimum element count so blank/garbage saves are rejected.  All SQL is
+;; parameterized; thumbnails are served as inert SVG images, never inlined.
+;; ---------------------------------------------------------------------------
+(define MAX-GALLERY     150)              ; rows kept (oldest evicted beyond this)
+(define GALLERY-PAGE    24)               ; cards per gallery page
+(define MAX-TITLE       60)               ; title chars
+(define MAX-SAVE-CODE   4000)             ; code chars accepted for a save
+(define MAX-SAVE-SVG    (* 160 1024))     ; stored thumbnail bytes
+(define MIN-SAVE-ELEMS  3)                ; reject near-empty / all-error art
+(define SAVE-COOLDOWN   12000)            ; ms between saves per client IP
+(define DB-PATH (or (getenv "GALLERY_DB") "gallery.sqlite"))
+
+(define gallery-lock (make-semaphore 1))
+(define gallery-conn #f)
+(define ip-last (make-hash))              ; ip -> last-save epoch ms (guarded by lock)
+
+;; Lazily open the connection and ensure the schema; returns #f if the DB is
+;; unavailable (feature degrades off rather than crashing the app).
+(define (gallery-db)
+  (or gallery-conn
+      (with-handlers ([exn:fail? (lambda (_) #f)])
+        (define c (sqlite3-connect #:database DB-PATH #:mode 'create))
+        (query-exec c (string-append
+                       "CREATE TABLE IF NOT EXISTS creations("
+                       "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                       "title TEXT NOT NULL, code TEXT NOT NULL, svg TEXT NOT NULL,"
+                       "created INTEGER NOT NULL, ip TEXT)"))
+        (set! gallery-conn c)
+        c)))
+
+(define (sanitize-title s)
+  (define t (string-normalize-spaces (regexp-replace* #px"[\u0000-\u001f]" (if (string? s) s "") " ")))
+  (define tt (string-trim t))
+  (cond [(= (string-length tt) 0) "fara titlu"]
+        [(> (string-length tt) MAX-TITLE) (substring tt 0 MAX-TITLE)]
+        [else tt]))
+
+;; Attempt to save a creation.  Returns (values ok? message).  Everything runs
+;; under the lock: the cooldown table, the render and the DB writes.
+(define (gallery-save! title code ip)
+  (call-with-semaphore gallery-lock
+    (lambda ()
+      (define now (current-inexact-milliseconds))
+      (define c (gallery-db))
+      (cond
+        [(not c) (values #f "Galeria este indisponibila momentan.")]
+        [(not (and (string? code) (non-empty-string? (string-trim code))))
+         (values #f "Nu e nimic de salvat.")]
+        [(> (string-length code) MAX-SAVE-CODE)
+         (values #f (format "Cod prea lung pentru galerie (max ~a caractere)." MAX-SAVE-CODE))]
+        [(let ([last (hash-ref ip-last ip #f)]) (and last (< (- now last) SAVE-COOLDOWN)))
+         (values #f "Prea repede — asteapta cateva secunde si incearca din nou.")]
+        [else
+         (define svg-x (parse-to-svg code))
+         (define svg (xexpr->string svg-x))
+         (cond
+           [(< (count-svg-nodes svg-x) MIN-SAVE-ELEMS)
+            (values #f "Creatia pare goala — randeaza ceva vizibil intai.")]
+           [(> (string-length svg) MAX-SAVE-SVG)
+            (values #f "Creatia e prea complexa pentru o miniatura din galerie.")]
+           [else
+            (with-handlers ([exn:fail? (lambda (_) (values #f "Nu am putut salva."))])
+              (query-exec c "INSERT INTO creations(title,code,svg,created,ip) VALUES (?,?,?,?,?)"
+                          (sanitize-title title) code svg (inexact->exact (floor now)) (or ip ""))
+              ;; ring buffer: evict anything older than the newest MAX-GALLERY
+              (query-exec c (string-append
+                             "DELETE FROM creations WHERE id NOT IN "
+                             "(SELECT id FROM creations ORDER BY id DESC LIMIT ?)") MAX-GALLERY)
+              (hash-set! ip-last ip now)
+              (values #t "Salvat in galerie!"))])]))))
+
+;; Latest creations (id, title, code), optionally older than `before`.
+(define (gallery-list before)
+  (define c (gallery-db))
+  (cond
+    [(not c) '()]
+    [else
+     (with-handlers ([exn:fail? (lambda (_) '())])
+       (call-with-semaphore gallery-lock
+         (lambda ()
+           (if (and before (exact-integer? before))
+               (query-rows c "SELECT id,title,code FROM creations WHERE id<? ORDER BY id DESC LIMIT ?" before GALLERY-PAGE)
+               (query-rows c "SELECT id,title,code FROM creations ORDER BY id DESC LIMIT ?" GALLERY-PAGE)))))]))
+
+;; Stored thumbnail SVG for an id, or #f.
+(define (gallery-svg id)
+  (define c (gallery-db))
+  (and c (exact-integer? id)
+       (with-handlers ([exn:fail? (lambda (_) #f)])
+         (call-with-semaphore gallery-lock
+           (lambda ()
+             (define r (query-maybe-value c "SELECT svg FROM creations WHERE id=?" id))
+             (and (string? r) r))))))
 
 (define DEFAULT-CODE
   (string-append
@@ -1001,6 +1112,23 @@ border:1px solid var(--border2);color:var(--text);padding:.7rem 1.1rem;border-ra
 box-shadow:0 10px 30px rgba(0,0,0,.4);transition:transform .25s;z-index:50}
 .toast.show{transform:translateX(-50%) translateY(0)}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
+.heronav{margin-top:.8rem}
+.saverow{display:flex;gap:.55rem;margin-top:.7rem;flex-wrap:wrap}
+.titlein{flex:1;min-width:160px;background:#0b0e17;color:#f5f6ff;border:1px solid var(--border);
+border-radius:10px;padding:.7rem .9rem;font:15px system-ui,sans-serif}
+.titlein::placeholder{color:#6b7490}
+.flash{margin:0 0 .8rem;padding:.6rem .9rem;border-radius:10px;font-size:.9rem;
+background:rgba(255,184,108,.14);border:1px solid rgba(255,184,108,.5);color:#ffcf99}
+.gallery{display:grid;gap:1.1rem;grid-template-columns:repeat(auto-fill,minmax(240px,1fr))}
+.gcard{margin:0;background:linear-gradient(180deg,var(--panel),var(--bg2));border:1px solid var(--border);
+border-radius:var(--radius);overflow:hidden;box-shadow:0 10px 24px rgba(0,0,0,.3);
+transition:transform .12s,border-color .12s}
+.gcard:hover{transform:translateY(-3px);border-color:var(--purple)}
+.gthumb{display:block;background:#000;line-height:0}
+.gthumb img{width:100%;height:auto;display:block;aspect-ratio:3/2;object-fit:contain}
+.gcap{display:flex;align-items:center;justify-content:space-between;gap:.5rem;padding:.6rem .8rem}
+.gtitle{font-weight:600;font-size:.9rem;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.gopen{font-size:.8rem;white-space:nowrap;color:var(--cyan)}
 ")
 
 ;; Served from /app.js (CSP script-src 'self'), so it can use < > & freely.
@@ -1279,6 +1407,67 @@ ENDJS
   `(div (h3 ,heading)
         (ul ,@(for/list ([it (in-list items)]) `(li (code ,it))))))
 
+;; Shared bits so the gallery page matches the editor page's chrome.
+(define FAVICON-HREF
+  "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0d14'/%3E%3Ccircle cx='16' cy='16' r='9' fill='%23bd93f9'/%3E%3C/svg%3E")
+(define THEME-BOOT
+  "try{var t=localStorage.getItem('theme');if(t){document.documentElement.setAttribute('data-theme',t);}}catch(e){}")
+
+;; ---------------------------------------------------------------------------
+;; Community gallery page.  Thumbnails are <img> to /thumb/<id> (inert SVG),
+;; each linking back into the editor via a ?c= permalink.
+;; ---------------------------------------------------------------------------
+(define (gallery-card row)
+  (define id (vector-ref row 0))
+  (define title (vector-ref row 1))
+  (define href (string-append "/?c=" (encode-share (vector-ref row 2))))
+  `(figure ((class "gcard"))
+     (a ((class "gthumb") (href ,href) (title "Deschide in editor"))
+        (img ((src ,(format "/thumb/~a" id)) (alt ,title) (loading "lazy")
+              (width "600") (height "400"))))
+     (figcaption ((class "gcap"))
+        (span ((class "gtitle")) ,title)
+        (a ((class "gopen") (href ,href)) "Deschide ↗"))))
+
+(define (gallery-page before)
+  (define rows (gallery-list before))
+  (define last-id (and (pair? rows) (= (length rows) GALLERY-PAGE)
+                       (vector-ref (last rows) 0)))
+  (response/xexpr
+   #:preamble #"<!DOCTYPE html>"
+   `(html ((lang "ro"))
+     (head
+      (meta ((charset "utf-8")))
+      (title "Galerie — Procedural Canvas DSL")
+      (meta ((name "viewport") (content "width=device-width, initial-scale=1")))
+      (meta ((name "color-scheme") (content "dark light")))
+      (meta ((name "theme-color") (content "#0b0d14")))
+      (meta ((name "description") (content "Creatii generative salvate de comunitate in Procedural Canvas DSL — apasa pentru a deschide in editor.")))
+      (link ((rel "canonical") (href "https://racket.micutu.com/gallery")))
+      (link ((rel "icon") (href ,FAVICON-HREF)))
+      (style ,PAGE-CSS)
+      (script ,THEME-BOOT))
+     (body
+      (div ((class "wrap"))
+       (header ((class "hero"))
+        (div ((class "badge")) "Galerie comunitara")
+        (h1 "Creatii salvate")
+        (p "Arta trimisa de vizitatori. Apasa o miniatura ca sa o deschizi si sa o modifici in editor.")
+        (p ((class "heronav")) (a ((href "/") (class "btn btn-ghost")) "← Inapoi la editor")))
+       (main ((id "main"))
+        ,(if (null? rows)
+             `(p ((class "hint") (style "text-align:center;padding:2rem 0"))
+                 "Inca nu exista creatii salvate. Fii primul: randeaza ceva in editor si apasa „Salveaza in galerie”.")
+             `(div ((class "gallery")) ,@(map gallery-card rows)))
+        ,@(if last-id
+              (list `(p ((style "text-align:center;margin-top:1.4rem"))
+                        (a ((href ,(format "/gallery?before=~a" last-id)) (class "btn btn-ghost"))
+                           "Mai vechi →")))
+              '()))
+       (footer
+        (p "Procedural Canvas DSL · "
+           (a ((href "/")) "editor"))))))))
+
 (define (start req)
   ;; The web-server body parser throws on malformed / non-UTF-8 form bodies;
   ;; swallow that so a hostile request degrades to empty bindings, not a 500.
@@ -1337,6 +1526,21 @@ ENDJS
             (make-header #"Cache-Control" #"no-store"))
       (list (string->bytes/utf-8 (xexpr->string svg))))]
 
+    ;; Gallery thumbnail: stored SVG served as an inert image (never inlined).
+    [(regexp-match #px"^thumb/([0-9]{1,12})$" (req-path req))
+     => (lambda (m)
+          (define svg (gallery-svg (string->number (cadr m))))
+          (if svg
+              (response/full 200 #"OK" (current-seconds) #"image/svg+xml; charset=utf-8"
+                             (list (make-header #"Cache-Control" #"public, max-age=86400, immutable"))
+                             (list (string->bytes/utf-8 svg)))
+              (response/full 404 #"Not Found" (current-seconds) #"text/plain" '() (list #"not found"))))]
+
+    ;; Community gallery page.
+    [(equal? (req-path req) "gallery")
+     (define before (string->number (extract-form-value #"before")))
+     (gallery-page (and (exact-integer? before) before))]
+
     [else
      (define action (extract-form-value #"action"))
      (define code-val (extract-form-value #"code"))
@@ -1359,7 +1563,16 @@ ENDJS
      (define final-code
        (if (non-empty-string? initial-code) initial-code DEFAULT-CODE))
 
+     ;; Saving to the gallery: on success send the author to the gallery (their
+     ;; creation is at the top); on failure re-render the editor with the reason.
+     (define-values (save-ok? save-msg)
+       (if (equal? action "save")
+           (gallery-save! (extract-form-value #"title") code-val (req-ip req))
+           (values #f #f)))
+
      (cond
+       [(and (equal? action "save") save-ok?)
+        (redirect-to "/gallery" see-other)]
        [(equal? action "download")
         (response/full
          200 #"OK"
@@ -1420,12 +1633,16 @@ ENDJS
              (header ((class "hero"))
               (div ((class "badge")) "Racket · web-server · SVG")
               (h1 "Procedural Canvas DSL")
-              (p "Scrie cod, obtii arta. Bucle, trigonometrie, culori si forme — totul randat pe server, apoi descarcabil ca SVG."))
+              (p "Scrie cod, obtii arta. Bucle, trigonometrie, culori si forme — totul randat pe server, apoi descarcabil ca SVG.")
+              (p ((class "heronav")) (a ((href "/gallery") (class "btn btn-ghost")) "🖼 Galerie comunitara")))
 
              (main ((id "main"))
              (div ((class "grid"))
               (section ((class "panel"))
                (h2 "Editor")
+               ,@(if (and (equal? action "save") save-msg)
+                     (list `(div ((class "flash") (role "alert")) ,save-msg))
+                     '())
                (form ((method "post") (id "editForm"))
                 (div ((class "editor-wrap") (id "editorWrap"))
                  (div ((class "gutter") (id "gutter") (aria-hidden "true")) "")
@@ -1443,7 +1660,11 @@ ENDJS
                  (button ((type "button") (id "btnCopy") (class "btn-ghost")) "⧉ Copiaza")
                  (button ((type "button") (id "btnSurprise") (class "btn-pink")) "🎲 Surpriza")
                  (button ((type "button") (id "btnTheme") (class "btn-ghost") (title "Schimba tema")) "🌓 Tema")
-                 (a ((href "/") (class "btn btn-ghost")) "↺ Reset")))
+                 (a ((href "/") (class "btn btn-ghost")) "↺ Reset"))
+                (div ((class "saverow"))
+                 (input ((type "text") (name "title") (maxlength "60") (class "titlein")
+                         (placeholder "Titlu creatie...") (aria-label "Titlu pentru galerie")))
+                 (button ((type "submit") (name "action") (value "save") (class "btn-cyan")) "💾 Salveaza in galerie")))
                (p ((class "hint"))
                   (span ((id "status") (aria-live "polite")) "Live: se randeaza pe masura ce scrii.")
                   " · " (kbd "Ctrl+Enter") " randeaza · " (kbd "Tab") " indenteaza."))
@@ -1512,6 +1733,9 @@ ENDJS
 ;; the definitions above without binding a socket, so the interpreter can be
 ;; exercised in isolation.
 (module+ main
+  ;; Open the gallery DB once up front so the first concurrent requests don't
+  ;; race to create the connection (the feature degrades off if this fails).
+  (void (gallery-db))
   (serve/servlet start
                  #:port PORT
                  #:listen-ip "127.0.0.1"
@@ -1683,4 +1907,26 @@ ENDJS
     (check-true (regexp-match? #px"\\.errbar" PAGE-CSS))
     (check-true (regexp-match? #px"function highlight" PAGE-JS))
     (check-true (regexp-match? #px"hl-on" PAGE-JS))
-    (check-true (regexp-match? #px"showErrors" PAGE-JS))))
+    (check-true (regexp-match? #px"showErrors" PAGE-JS)))
+
+  ;; --- round 6: gallery helpers --------------------------------------------
+  (test-case "share encode/decode round-trips (incl. non-ASCII)"
+    (define src "(bg \"#0b0f1a\") ;; vârtej cu diacritice\n(circle 1 1 1 \"red\")")
+    ;; encode-share percent-encodes +,/,=; the server URL-decodes before decode-share
+    (define enc (encode-share src))
+    (define url-decoded (regexp-replaces enc '((#rx"%2B" "+") (#rx"%2F" "/") (#rx"%3D" "="))))
+    (check-equal? (decode-share url-decoded) src))
+
+  (test-case "sanitize-title trims, caps length and strips control chars"
+    (check-equal? (sanitize-title "   ") "fara titlu")
+    (check-equal? (sanitize-title "") "fara titlu")
+    (check-equal? (sanitize-title "  hello  world  ") "hello world")
+    (check-equal? (sanitize-title (string-append "x\u0000\u0007y")) "x y")
+    (check-true (<= (string-length (sanitize-title (make-string 200 #\a))) MAX-TITLE)))
+
+  (test-case "gallery card escapes the title and links the thumbnail"
+    (define s (xexpr->string (gallery-card (vector 7 "<b>hax</b>" "(circle 1 1 1 \"red\")"))))
+    (check-true (regexp-match? #px"/thumb/7" s))
+    (check-true (regexp-match? #px"&lt;b&gt;hax" s))   ; escaped, not raw markup
+    (check-false (regexp-match? #px"<b>hax</b>" s))
+    (check-true (regexp-match? #px"/\\?c=" s))))        ; open-in-editor permalink

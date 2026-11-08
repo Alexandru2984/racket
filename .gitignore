@@ -9,3 +9,7 @@ compiled/
 # local artifacts
 *.log
 uploads/
+
+# gallery database (runtime)
+gallery.sqlite
+gallery.sqlite-*
