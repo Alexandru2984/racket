@@ -32,6 +32,9 @@ variable `i` is the current iteration index.
 | `(triangle x1 y1 x2 y2 x3 y3 color)` | filled triangle |
 | `(poly cx cy sides r color)` | filled regular n-gon |
 | `(heart cx cy size color)` | filled heart |
+| `(sector cx cy r a0 a1 color)` | filled pie slice (degrees) |
+| `(spiral cx cy turns r0 r1 color width)` | Archimedean spiral |
+| `(curve color width x1 y1 x2 y2 ...)` | smooth open curve through points |
 | `(polygon color x1 y1 x2 y2 ...)` | filled polygon |
 | `(polyline color width x1 y1 ...)` | open stroked path |
 | `(star cx cy spikes r-outer r-inner color)` | star / n-gon burst |
@@ -60,6 +63,12 @@ SVG-native, so motion is preserved in the downloaded `.svg` (no JavaScript).
 | `(opacity a cmd ...)` | apply group opacity `a` in `[0,1]` |
 | `(spin cx cy seconds cmd ...)` | continuously rotate the body |
 | `(pulse seconds cmd ...)` | continuously fade the body in/out |
+| `(blur px cmd ...)` | gaussian blur the body |
+| `(glow color cmd ...)` | colored outer glow |
+| `(shadow dx dy px color cmd ...)` | drop shadow |
+
+Effects are SVG `<filter>`s registered in `<defs>` (preserved in downloads, no
+JavaScript); identical filters are deduplicated per render.
 
 ### Numbers
 `+  -  *  /  mod  pow  sin  cos  tan  atan  atan2  sqrt  exp  log  abs  neg
@@ -83,6 +92,7 @@ Constants: `pi  tau  width  height`.
 | Builder | Meaning |
 | --- | --- |
 | `(hsv h s v)` | HSV color (hue 0–360, sat/value 0–100) |
+| `(palette "name" i)` | curated palette color: fire, ocean, neon, pastel, sunset, forest, mono |
 | `(mix c1 c2 t)` | blend any two colors in RGB at `t` in `[0,1]` |
 | `(linear-bg deg c1 c2 ...)` | fill the canvas with a linear gradient |
 | `(radial-bg c1 c2 ...)` | fill the canvas with a radial gradient |
