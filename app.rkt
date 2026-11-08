@@ -944,8 +944,10 @@ white-space:pre;overflow:auto;letter-spacing:normal}
 pointer-events:none;overflow:hidden;display:none}
 .editor-wrap textarea{position:relative;z-index:2;background:#0b0e17}
 .hl code{font:inherit;white-space:pre}
+/* The editor surface is always dark, so its text uses fixed light colors
+   (not theme vars, which would flip to dark and fail contrast in light mode). */
 .gutter{position:absolute;left:1px;top:1px;bottom:1px;width:3em;z-index:3;overflow:hidden;
-padding:1rem .5rem 1rem 0;text-align:right;color:var(--muted);opacity:.55;
+padding:1rem .5rem 1rem 0;text-align:right;color:#8089a8;
 font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre;
 background:#0b0e17;border-right:1px solid var(--border);border-radius:10px 0 0 10px;
 pointer-events:none;display:none}
@@ -953,8 +955,8 @@ pointer-events:none;display:none}
 .hl-on .editor-wrap textarea{color:transparent;background:transparent;caret-color:#f5f6ff}
 .hl-on .editor-wrap textarea,.hl-on .hl{padding-left:3.6em}
 .hl-on .hl code{padding-left:0}
-.tk-cmd{color:var(--purple);font-weight:600}.tk-num{color:var(--cyan)}
-.tk-str{color:var(--green)}.tk-com{color:#5b647f;font-style:italic}.tk-par{color:#7a84a6}
+.tk-cmd{color:#bd93f9;font-weight:600}.tk-num{color:#8be9fd}
+.tk-str{color:#7ef0a0}.tk-com{color:#7e88a8;font-style:italic}.tk-par{color:#8089a8}
 .errbar{display:none;margin:.5rem 0 0;padding:.5rem .7rem;border-radius:8px;font-size:.82rem;
 background:rgba(255,85,85,.12);border:1px solid rgba(255,85,85,.4);color:#ff9b9b;
 font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word}
@@ -971,7 +973,7 @@ button:active,.btn:active{transform:translateY(1px)}
 .stage svg{width:100%;height:auto;display:block}
 .hint{color:var(--muted);font-size:.85rem;margin:.55rem 0 0}
 kbd{font:600 11px ui-monospace,Menlo,monospace;background:#0b0e17;border:1px solid var(--border2);
-border-bottom-width:2px;border-radius:5px;padding:.08rem .35rem;color:var(--cyan)}
+border-bottom-width:2px;border-radius:5px;padding:.08rem .35rem;color:#8be9fd}
 #status{color:var(--green)}
 .examples{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:.6rem}
 .ex-form{margin:0;display:block}
@@ -992,7 +994,7 @@ details.cheat>summary{cursor:pointer;font-weight:700;color:var(--text);padding:.
 .cheat-grid h3{color:var(--cyan);font-size:.78rem;text-transform:uppercase;letter-spacing:.05em;margin:.1rem 0 .5rem}
 .cheat-grid ul{list-style:none;margin:0;padding:0}.cheat-grid li{margin:.35rem 0}
 code{background:#0b0e17;border:1px solid var(--border);padding:.14rem .42rem;border-radius:6px;
-font:12.5px ui-monospace,Menlo,monospace;color:var(--green);white-space:nowrap}
+font:12.5px ui-monospace,Menlo,monospace;color:#7ef0a0;white-space:nowrap}
 footer{text-align:center;color:var(--muted);font-size:.85rem;margin-top:2rem;padding-top:1rem;border-top:1px solid var(--border)}
 .toast{position:fixed;left:50%;bottom:1.2rem;transform:translateX(-50%) translateY(150%);background:var(--panel2);
 border:1px solid var(--border2);color:var(--text);padding:.7rem 1.1rem;border-radius:10px;
@@ -1420,6 +1422,7 @@ ENDJS
               (h1 "Procedural Canvas DSL")
               (p "Scrie cod, obtii arta. Bucle, trigonometrie, culori si forme — totul randat pe server, apoi descarcabil ca SVG."))
 
+             (main ((id "main"))
              (div ((class "grid"))
               (section ((class "panel"))
                (h2 "Editor")
@@ -1429,8 +1432,9 @@ ENDJS
                  (pre ((class "hl") (id "hl") (aria-hidden "true")) (code ((id "hlcode")) ""))
                  (textarea ((id "code") (name "code") (spellcheck "false") (wrap "off")
                             (autocomplete "off") (autocapitalize "off") (autocorrect "off")
+                            (aria-label "Editor de cod DSL")
                             (placeholder "Codul tau aici...")) ,final-code))
-                (div ((class "errbar") (id "errbar") (hidden "hidden")) "")
+                (div ((class "errbar") (id "errbar") (role "alert") (aria-live "assertive") (hidden "hidden")) "")
                 (div ((class "toolbar"))
                  (button ((type "submit") (name "action") (value "preview")) "▶ Randeaza")
                  (button ((type "submit") (name "action") (value "download") (class "btn-cyan")) "⭳ SVG")
@@ -1441,16 +1445,18 @@ ENDJS
                  (button ((type "button") (id "btnTheme") (class "btn-ghost") (title "Schimba tema")) "🌓 Tema")
                  (a ((href "/") (class "btn btn-ghost")) "↺ Reset")))
                (p ((class "hint"))
-                  (span ((id "status")) "Live: se randeaza pe masura ce scrii.")
+                  (span ((id "status") (aria-live "polite")) "Live: se randeaza pe masura ce scrii.")
                   " · " (kbd "Ctrl+Enter") " randeaza · " (kbd "Tab") " indenteaza."))
 
               (section ((class "panel"))
                (h2 "Panza (600 × 400)")
-               (div ((class "stage") (id "stage")) ,(parse-to-svg final-code))
+               (div ((class "stage") (id "stage") (role "img")
+                     (aria-label "Panza cu arta generata din cod")) ,(parse-to-svg final-code))
                (h2 ((style "margin-top:1.15rem")) "Imagine → cod DSL")
                (form ((method "post") (enctype "multipart/form-data") (class "file-row"))
                 (input ((type "hidden") (name "action") (value "upload")))
-                (input ((type "file") (id "image_file") (name "image_file") (accept "image/png,image/jpeg")))
+                (input ((type "file") (id "image_file") (name "image_file") (accept "image/png,image/jpeg")
+                        (aria-label "Incarca o imagine JPG sau PNG")))
                 (span ((id "fname") (class "hint")) "")
                 (button ((type "submit") (class "btn-pink")) "Converteste"))
                (p ((class "hint")) "JPG/PNG, max 3 MB. Imaginea devine cerculete DSL pe care le poti edita.")))
@@ -1493,11 +1499,12 @@ ENDJS
                         "(hsl h s l)" "(hsla h s l a)" "(hsv h s v)" "(mix c1 c2 t)"
                         "(palette \"nume\" i)" "fire ocean neon pastel sunset forest"
                         "(linear-bg grd c1 c2 ...)" "(radial-bg c1 c2 ...)"))))
+             ) ; /main
 
              (footer
               (p "Procedural Canvas DSL · scris in Racket cu web-server · "
                  (a ((href "https://github.com/Alexandru2984/racket") (target "_blank") (rel "noopener")) "cod sursa"))))
-            (div ((id "toast") (class "toast")) "")
+            (div ((id "toast") (class "toast") (role "status") (aria-live "polite")) "")
             (script ((src ,(string-append "/app.js?v=" APP-JS-VER)) (defer "defer"))))))])]))
 
 ;; The server only starts when this file is *run* (`racket app.rkt` executes the

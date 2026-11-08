@@ -10,6 +10,11 @@ Environment=RACKET_APP_PORT=8345
 ExecStart=/usr/bin/racket /home/micu/racket_app/app.rkt
 Restart=always
 RestartSec=2
+# The web-server process exits promptly on SIGINT (Racket break); the default
+# SIGTERM can leave `systemctl restart` blocked up to the stop timeout. SIGINT
+# plus a short cap keeps restarts to a couple of seconds.
+KillSignal=SIGINT
+TimeoutStopSec=20
 
 # --- Resource limits ---------------------------------------------------------
 # The DSL is public and unauthenticated. The in-app budgets already bound a
