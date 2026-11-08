@@ -934,6 +934,31 @@ textarea{width:100%;min-height:340px;resize:vertical;background:#0b0e17;color:#f
 border:1px solid var(--border);border-radius:10px;padding:1rem;tab-size:2;
 font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 textarea:focus,input:focus,button:focus-visible,.btn:focus-visible{outline:2px solid var(--purple);outline-offset:2px}
+/* --- pro editor: gutter + syntax-highlight overlay under the textarea --- */
+.editor-wrap{position:relative;min-height:340px}
+.editor-wrap textarea,.hl{box-sizing:border-box;width:100%;min-height:340px;margin:0;
+border:1px solid var(--border);border-radius:10px;padding:1rem;tab-size:2;
+font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+white-space:pre;overflow:auto;letter-spacing:normal}
+.hl{position:absolute;inset:0;z-index:1;background:#0b0e17;color:#8089a8;
+pointer-events:none;overflow:hidden;display:none}
+.editor-wrap textarea{position:relative;z-index:2;background:#0b0e17}
+.hl code{font:inherit;white-space:pre}
+.gutter{position:absolute;left:1px;top:1px;bottom:1px;width:3em;z-index:3;overflow:hidden;
+padding:1rem .5rem 1rem 0;text-align:right;color:var(--muted);opacity:.55;
+font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre;
+background:#0b0e17;border-right:1px solid var(--border);border-radius:10px 0 0 10px;
+pointer-events:none;display:none}
+.hl-on .hl{display:block}.hl-on .gutter{display:block}
+.hl-on .editor-wrap textarea{color:transparent;background:transparent;caret-color:#f5f6ff}
+.hl-on .editor-wrap textarea,.hl-on .hl{padding-left:3.6em}
+.hl-on .hl code{padding-left:0}
+.tk-cmd{color:var(--purple);font-weight:600}.tk-num{color:var(--cyan)}
+.tk-str{color:var(--green)}.tk-com{color:#5b647f;font-style:italic}.tk-par{color:#7a84a6}
+.errbar{display:none;margin:.5rem 0 0;padding:.5rem .7rem;border-radius:8px;font-size:.82rem;
+background:rgba(255,85,85,.12);border:1px solid rgba(255,85,85,.4);color:#ff9b9b;
+font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word}
+.errbar.show{display:block}
 .toolbar{display:flex;flex-wrap:wrap;gap:.55rem;margin-top:.8rem}
 button,.btn{font:600 15px/1 system-ui,sans-serif;cursor:pointer;border:none;border-radius:10px;
 padding:.75rem 1.1rem;color:var(--btn-text);background:var(--purple);display:inline-flex;align-items:center;
@@ -987,12 +1012,62 @@ box-shadow:0 10px 30px rgba(0,0,0,.4);transition:transform .25s;z-index:50}
   var stage = document.getElementById('stage');
   var statusEl = document.getElementById('status');
   var toastEl = document.getElementById('toast');
+  var hl = document.getElementById('hl');
+  var hlcode = document.getElementById('hlcode');
+  var gutter = document.getElementById('gutter');
+  var errbar = document.getElementById('errbar');
   var tt, deb;
 
   function bind(id, fn){ var el = document.getElementById(id); if (el){ el.addEventListener('click', fn); } }
   function toast(m){ if (!toastEl) return; toastEl.textContent = m; toastEl.classList.add('show');
     clearTimeout(tt); tt = setTimeout(function(){ toastEl.classList.remove('show'); }, 1800); }
   function setStatus(m){ if (statusEl) statusEl.textContent = m; }
+
+  // ---- syntax highlighting (overlay under the textarea) ------------------
+  var KW = {};
+  ("circle rect ellipse line ring arc triangle poly heart sector spiral curve " +
+   "polygon polyline star text bg repeat for grid let seed group rotate translate " +
+   "scale opacity spin pulse blur glow shadow rgb rgba hsl hsla hsv palette mix " +
+   "linear-bg radial-bg mod pow sin cos tan atan atan2 sqrt exp log abs neg sign " +
+   "floor round ceil min max hypot dist lerp clamp map noise random pi tau width height"
+  ).split(' ').forEach(function(k){ KW[k] = 1; });
+
+  function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function highlight(src){
+    var out = '', i = 0, n = src.length;
+    while (i < n){
+      var c = src[i];
+      if (c === ';'){ var j = src.indexOf('\n', i); if (j < 0) j = n;
+        out += '<span class="tk-com">' + esc(src.slice(i, j)) + '</span>'; i = j; }
+      else if (c === '"'){ var j = i + 1; while (j < n && src[j] !== '"') j++; if (j < n) j++;
+        out += '<span class="tk-str">' + esc(src.slice(i, j)) + '</span>'; i = j; }
+      else if (c === '(' || c === ')'){ out += '<span class="tk-par">' + c + '</span>'; i++; }
+      else if (/[0-9]/.test(c) || (c === '-' && /[0-9.]/.test(src[i+1] || ''))){
+        var j = i + 1; while (j < n && /[0-9.eE+-]/.test(src[j])) j++;
+        out += '<span class="tk-num">' + esc(src.slice(i, j)) + '</span>'; i = j; }
+      else if (/[a-zA-Z]/.test(c)){
+        var j = i + 1; while (j < n && /[a-zA-Z0-9?*+\/<>=!-]/.test(src[j])) j++;
+        var w = src.slice(i, j);
+        out += KW[w] ? '<span class="tk-cmd">' + esc(w) + '</span>' : esc(w); i = j; }
+      else { out += esc(c); i++; }
+    }
+    return out;
+  }
+  function syncEditor(){
+    if (!ta || !hlcode) return;
+    var v = ta.value;
+    hlcode.innerHTML = highlight(v) + '\n';
+    if (gutter){
+      var lines = v.split('\n').length, g = '';
+      for (var k = 1; k <= lines; k++) g += k + '\n';
+      gutter.textContent = g;
+    }
+    syncScroll();
+  }
+  function syncScroll(){
+    if (hl && ta){ hl.scrollTop = ta.scrollTop; hl.scrollLeft = ta.scrollLeft; }
+    if (gutter && ta){ gutter.scrollTop = ta.scrollTop; }
+  }
 
   // ---- live render -------------------------------------------------------
   var inflight = false, pending = false;
@@ -1008,20 +1083,53 @@ box-shadow:0 10px 30px rgba(0,0,0,.4);transition:transform .25s;z-index:50}
         return r.text().then(function(t){ return { t:t, ms:ms, el:el }; }); })
       .then(function(o){ stage.innerHTML = o.t;
         var ms = (o.ms != null) ? o.ms : Math.round(performance.now() - t0);
-        setStatus((o.el || '?') + ' elemente · ' + ms + ' ms'); })
+        setStatus((o.el || '?') + ' elemente · ' + ms + ' ms'); showErrors(); })
       .catch(function(){ setStatus('eroare de retea'); })
       .then(function(){ inflight = false; if (pending){ pending = false; render(); } });
   }
   function scheduleRender(){ clearTimeout(deb); deb = setTimeout(render, 450); }
 
+  // Surface interpreter error nodes (fill="#ff5555") from the rendered SVG.
+  function showErrors(){
+    if (!errbar || !stage) return;
+    var nodes = stage.querySelectorAll('text[fill="#ff5555"]');
+    if (!nodes.length){ errbar.classList.remove('show'); errbar.textContent = ''; return; }
+    var msgs = [];
+    for (var k = 0; k < nodes.length && k < 6; k++) msgs.push('⚠ ' + nodes[k].textContent);
+    errbar.textContent = msgs.join('\n'); errbar.classList.add('show');
+  }
+
+  // Insert text at the caret, keep the selection sensible, refresh the editor.
+  function setRange(value, start, end){
+    ta.value = value; ta.selectionStart = start; ta.selectionEnd = (end == null ? start : end);
+    syncEditor();
+  }
+  var PAIRS = { '(' : ')', '"' : '"' };
+
   if (ta){
-    ta.addEventListener('input', scheduleRender);
+    ta.addEventListener('input', function(){ syncEditor(); scheduleRender(); });
+    ta.addEventListener('scroll', syncScroll);
     ta.addEventListener('keydown', function(e){
-      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter'){ e.preventDefault(); clearTimeout(deb); render(); }
-      else if (e.key === 'Tab'){ e.preventDefault();
-        var s = ta.selectionStart, en = ta.selectionEnd;
-        ta.value = ta.value.slice(0, s) + '  ' + ta.value.slice(en);
-        ta.selectionStart = ta.selectionEnd = s + 2; scheduleRender(); }
+      var s = ta.selectionStart, en = ta.selectionEnd, v = ta.value;
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter'){ e.preventDefault(); clearTimeout(deb); render(); return; }
+      if (e.key === 'Tab'){ e.preventDefault();
+        setRange(v.slice(0, s) + '  ' + v.slice(en), s + 2); scheduleRender(); return; }
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      // skip over a closing char typed right before itself (checked first so a
+      // closing " isn't mistaken for a new opening pair)
+      if ((e.key === ')' || e.key === '"') && s === en && v[s] === e.key){
+        e.preventDefault(); setRange(v, s + 1); return;
+      }
+      // auto-close ( and " (quotes only on an empty selection)
+      if (PAIRS[e.key] && (e.key !== '"' || s === en)){
+        e.preventDefault();
+        setRange(v.slice(0, s) + e.key + PAIRS[e.key] + v.slice(en), s + 1);
+        scheduleRender(); return;
+      }
+      // backspace empties a matching pair in one keystroke
+      if (e.key === 'Backspace' && s === en && s > 0 && PAIRS[v[s-1]] === v[s]){
+        e.preventDefault(); setRange(v.slice(0, s-1) + v.slice(s+1), s-1); scheduleRender(); return;
+      }
     });
   }
 
@@ -1094,7 +1202,7 @@ box-shadow:0 10px 30px rgba(0,0,0,.4);transition:transform .25s;z-index:50}
   bind('btnSurprise', function(){
     if (!ta) return;
     ta.value = templates[ri(0, templates.length - 1)](ri(1, 99999));
-    clearTimeout(deb); render(); toast('Surpriza!');
+    syncEditor(); clearTimeout(deb); render(); toast('Surpriza!');
   });
 
   // ---- theme toggle ------------------------------------------------------
@@ -1110,6 +1218,10 @@ box-shadow:0 10px 30px rgba(0,0,0,.4);transition:transform .25s;z-index:50}
   var f = document.getElementById('image_file');
   if (f){ f.addEventListener('change', function(){ var n = document.getElementById('fname');
     if (n){ n.textContent = f.files[0] ? f.files[0].name : ''; } }); }
+
+  // ---- enable the pro editor + surface any errors already on the canvas --
+  if (ta && hl && hlcode){ document.body.classList.add('hl-on'); syncEditor(); }
+  showErrors();
 })();
 ENDJS
 )
@@ -1312,9 +1424,13 @@ ENDJS
               (section ((class "panel"))
                (h2 "Editor")
                (form ((method "post") (id "editForm"))
-                (textarea ((id "code") (name "code") (spellcheck "false")
-                           (autocomplete "off") (autocapitalize "off") (autocorrect "off")
-                           (placeholder "Codul tau aici...")) ,final-code)
+                (div ((class "editor-wrap") (id "editorWrap"))
+                 (div ((class "gutter") (id "gutter") (aria-hidden "true")) "")
+                 (pre ((class "hl") (id "hl") (aria-hidden "true")) (code ((id "hlcode")) ""))
+                 (textarea ((id "code") (name "code") (spellcheck "false") (wrap "off")
+                            (autocomplete "off") (autocapitalize "off") (autocorrect "off")
+                            (placeholder "Codul tau aici...")) ,final-code))
+                (div ((class "errbar") (id "errbar") (hidden "hidden")) "")
                 (div ((class "toolbar"))
                  (button ((type "submit") (name "action") (value "preview")) "▶ Randeaza")
                  (button ((type "submit") (name "action") (value "download") (class "btn-cyan")) "⭳ SVG")
@@ -1551,4 +1667,13 @@ ENDJS
 
   (test-case "effect filters still obey the element budget"
     (define svg (parse-to-svg (string-append "(repeat 9000 (glow \"red\" (circle 1 1 1 \"red\")))")))
-    (check-true (< (count-nodes svg) 60000))))
+    (check-true (< (count-nodes svg) 60000)))
+
+  ;; --- round 4: pro editor assets are wired into the page --------------------
+  (test-case "pro editor markup, styles and script are present"
+    (check-true (regexp-match? #px"editor-wrap" PAGE-CSS))
+    (check-true (regexp-match? #px"tk-cmd" PAGE-CSS))
+    (check-true (regexp-match? #px"\\.errbar" PAGE-CSS))
+    (check-true (regexp-match? #px"function highlight" PAGE-JS))
+    (check-true (regexp-match? #px"hl-on" PAGE-JS))
+    (check-true (regexp-match? #px"showErrors" PAGE-JS))))
