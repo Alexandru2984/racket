@@ -115,12 +115,18 @@ Constants: `pi  tau  width  height`.
 
 - **Live preview** — the editor renders as you type (debounced); `Ctrl+Enter`
   renders now, `Tab` indents. A status line shows element count and render time.
+- **Pro editor** — syntax highlighting, a line-number gutter, auto-closing
+  parens/quotes and an inline error bar, all as progressive enhancement over a
+  plain textarea.
 - **Export** — download the art as **SVG** (server) or **PNG** (client-side
   canvas rasterization at 2×).
 - **Share** — the 🔗 button builds a `?c=<base64>` permalink of the current
   program and copies it to the clipboard.
 - **Surprise** — five seeded generators (flow field, vortex, kaleidoscope,
   polar rose, pulsing rings) produce new art in one click.
+- **Community gallery** — save a creation and browse everyone's work; each
+  thumbnail opens back in the editor via a permalink. Public and
+  unauthenticated, so it is bounded on every axis (see below).
 - **Image → DSL** — upload a JPG/PNG and get editable DSL circles back.
 - **Light / dark theme** — 🌓 toggle, persisted in `localStorage` and applied
   before first paint (the editor and canvas stay dark by design).
@@ -136,6 +142,9 @@ Constants: `pi  tau  width  height`.
 | `GET /` | the editor + canvas page (accepts `?c=<base64>` permalinks) |
 | `POST /` | `action=preview` (render), `action=download` (SVG file), `action=upload` (image → DSL) |
 | `POST /api/render` | render `code` to SVG; `X-Render-Ms` / `X-Elements` headers |
+| `POST /` + `action=save` | save a creation to the gallery (303 → `/gallery`) |
+| `GET /gallery` | the community gallery (paginated via `?before=<id>`) |
+| `GET /thumb/<id>` | a saved creation's thumbnail, as an inert SVG image |
 | `GET /app.js` | the front-end script (served same-origin for CSP) |
 | `GET /og.png` | 1200×630 Open Graph image, rendered once with `racket/draw` |
 | `GET /sitemap.xml` | sitemap for the public page |
@@ -173,6 +182,12 @@ drawing anything can no longer bypass the caps.
   reproducible and never leaks between requests.
 - **Robust I/O** — malformed / non-UTF-8 request bodies degrade to empty
   bindings instead of a 500.
+- **Gallery writes** (public, unauthenticated) are bounded too: a SQLite ring
+  buffer caps the row count (so disk is bounded), with per-entry caps on title,
+  code and stored SVG, a per-IP cooldown, and a minimum element count to reject
+  blank/garbage saves. All SQL is parameterized; thumbnails are served as inert
+  SVG images and titles are escaped, so a `<script>` title is stored and shown
+  as literal text.
 
 Infrastructure (see the config files) adds:
 - **systemd sandbox** with `MemoryMax` / `CPUQuota` / `TasksMax` and a strict
@@ -237,7 +252,8 @@ sudo nginx -t && sudo systemctl reload nginx
 
 | File | Purpose |
 | --- | --- |
-| `app.rkt` | the entire application (parser, interpreter, API, UI) |
+| `app.rkt` | the entire application (parser, interpreter, API, gallery, UI) |
+| `gallery.sqlite` | runtime community-gallery store (gitignored) |
 | `.github/workflows/ci.yml` | compile + test + smoke-check pipeline |
 | `racket-app.service` | hardened systemd unit (template) |
 | `racket.micutu.com.conf` | hardened nginx vhost (template) |
