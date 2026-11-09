@@ -129,8 +129,9 @@ Constants: `pi  tau  width  height`.
 - **Surprise** — five seeded generators (flow field, vortex, kaleidoscope,
   polar rose, pulsing rings) produce new art in one click.
 - **Community gallery** — save a creation and browse everyone's work; each
-  thumbnail opens back in the editor via a permalink. Public and
-  unauthenticated, so it is bounded on every axis (see below).
+  thumbnail opens back in the editor via a permalink, with one-tap ♥ likes
+  (one per IP) and a recent/popular toggle. Public and unauthenticated, so it
+  is bounded on every axis (see below).
 - **Image → DSL** — upload a JPG/PNG and get editable DSL circles back.
 - **Light / dark theme** — 🌓 toggle, persisted in `localStorage` and applied
   before first paint (the editor and canvas stay dark by design).
@@ -147,6 +148,8 @@ Constants: `pi  tau  width  height`.
 | `POST /` | `action=preview` (render), `action=download` (SVG file), `action=upload` (image → DSL) |
 | `POST /api/render` | render `code` to SVG; `X-Render-Ms` / `X-Elements` headers |
 | `POST /api/save` | save a creation (JSON), for the no-reload save button |
+| `POST /api/like` | like a creation once per IP (JSON) |
+| `GET /gallery?sort=popular` | gallery ordered by likes |
 | `POST /` + `action=save` | save a creation to the gallery (303 → `/gallery`; no-JS fallback) |
 | `GET /gallery` | the community gallery (paginated via `?before=<id>`) |
 | `GET /thumb/<id>` | a saved creation's thumbnail, as an inert SVG image |
