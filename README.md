@@ -66,6 +66,8 @@ SVG-native, so motion is preserved in the downloaded `.svg` (no JavaScript).
 | `(blur px cmd ...)` | gaussian blur the body |
 | `(glow color cmd ...)` | colored outer glow |
 | `(shadow dx dy px color cmd ...)` | drop shadow |
+| `(stroke color width cmd ...)` | outline the shapes in the body |
+| `(dash on off cmd ...)` | make their strokes dashed |
 
 Effects are SVG `<filter>`s registered in `<defs>` (preserved in downloads, no
 JavaScript); identical filters are deduplicated per render.
@@ -94,6 +96,8 @@ Constants: `pi  tau  width  height`.
 | `(hsv h s v)` | HSV color (hue 0–360, sat/value 0–100) |
 | `(palette "name" i)` | curated palette color: fire, ocean, neon, pastel, sunset, forest, mono |
 | `(mix c1 c2 t)` | blend any two colors in RGB at `t` in `[0,1]` |
+| `(linear angle c1 c2 ...)` | gradient **fill** for a shape (per-shape, any shape) |
+| `(radial c1 c2 ...)` | radial gradient fill for a shape |
 | `(linear-bg deg c1 c2 ...)` | fill the canvas with a linear gradient |
 | `(radial-bg c1 c2 ...)` | fill the canvas with a radial gradient |
 
@@ -142,7 +146,8 @@ Constants: `pi  tau  width  height`.
 | `GET /` | the editor + canvas page (accepts `?c=<base64>` permalinks) |
 | `POST /` | `action=preview` (render), `action=download` (SVG file), `action=upload` (image → DSL) |
 | `POST /api/render` | render `code` to SVG; `X-Render-Ms` / `X-Elements` headers |
-| `POST /` + `action=save` | save a creation to the gallery (303 → `/gallery`) |
+| `POST /api/save` | save a creation (JSON), for the no-reload save button |
+| `POST /` + `action=save` | save a creation to the gallery (303 → `/gallery`; no-JS fallback) |
 | `GET /gallery` | the community gallery (paginated via `?before=<id>`) |
 | `GET /thumb/<id>` | a saved creation's thumbnail, as an inert SVG image |
 | `GET /app.js` | the front-end script (served same-origin for CSP) |
