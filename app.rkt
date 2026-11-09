@@ -220,7 +220,13 @@
         "pastel" (vector "#ffd1dc" "#ffe7c2" "#fff5ba" "#d4f0c0" "#c7e9ff" "#e3d1ff")
         "sunset" (vector "#0d1b2a" "#3b185f" "#88307a" "#d34e8c" "#ff7e5f" "#ffd080")
         "forest" (vector "#06230f" "#114d2a" "#2e7d32" "#66bb6a" "#aed581" "#e6ee9c")
-        "mono"   (vector "#111111" "#444444" "#777777" "#aaaaaa" "#dddddd" "#ffffff")))
+        "mono"   (vector "#111111" "#444444" "#777777" "#aaaaaa" "#dddddd" "#ffffff")
+        "ice"    (vector "#06121f" "#0e2a45" "#1f5673" "#4a9bb0" "#9fd8e0" "#eafbff")
+        "lava"   (vector "#1a0000" "#4d0000" "#990f00" "#e63900" "#ff8c1a" "#ffd633")
+        "candy"  (vector "#ff5fa2" "#ff8fc7" "#c084fc" "#8be9fd" "#7cf4b0" "#fff59e")
+        "earth"  (vector "#2b1d0e" "#5a3d1e" "#8a6d3b" "#b89b6a" "#6b8e23" "#a8c686")
+        "aurora" (vector "#011627" "#032b43" "#0b6e4f" "#2ec4b6" "#80ffdb" "#c77dff")
+        "retro"  (vector "#2b2d42" "#8d99ae" "#ef476f" "#ffd166" "#06d6a0" "#118ab2")))
 
 (define (palette-color name i)
   (define v (hash-ref PALETTES (string-downcase (string-trim name)) #f))
@@ -936,6 +942,10 @@
 (define MIN-SAVE-ELEMS  3)                ; reject near-empty / all-error art
 (define SAVE-COOLDOWN   12000)            ; ms between saves per client IP
 (define DB-PATH (or (getenv "GALLERY_DB") "gallery.sqlite"))
+;; Optional admin token (from the environment, never the repo).  Admin
+;; moderation is only enabled when it is set to a non-empty value.
+(define ADMIN-TOKEN (let ([t (getenv "GALLERY_ADMIN_TOKEN")]) (and t (non-empty-string? t) t)))
+(define (admin? tok) (and ADMIN-TOKEN (string? tok) (string=? tok ADMIN-TOKEN)))
 
 (define gallery-lock (make-semaphore 1))
 (define gallery-conn #f)
@@ -1050,6 +1060,28 @@
                 (query-exec c "UPDATE creations SET likes=likes+1 WHERE id=?" id)
                 (query-value c "SELECT likes FROM creations WHERE id=?" id)]))))))
 
+;; One creation as a (id title code likes) vector, or #f.
+(define (gallery-get id)
+  (define c (gallery-db))
+  (and c (exact-integer? id)
+       (with-handlers ([exn:fail? (lambda (_) #f)])
+         (call-with-semaphore gallery-lock
+           (lambda ()
+             (query-maybe-row c "SELECT id,title,code,likes FROM creations WHERE id=?" id))))))
+
+;; Delete a creation (admin only); returns #t if a row was removed.
+(define (gallery-delete! id)
+  (define c (gallery-db))
+  (and c (exact-integer? id)
+       (with-handlers ([exn:fail? (lambda (_) #f)])
+         (call-with-semaphore gallery-lock
+           (lambda ()
+             (define existed (query-maybe-value c "SELECT 1 FROM creations WHERE id=?" id))
+             (when existed
+               (query-exec c "DELETE FROM creations WHERE id=?" id)
+               (query-exec c "DELETE FROM likes_log WHERE creation=?" id))
+             (and existed #t))))))
+
 (define DEFAULT-CODE
   (string-append
    ";; (i) = indexul buclei. Incearca: noise, mix, gradient, spin, seed.\n"
@@ -1130,6 +1162,13 @@ pointer-events:none;display:none}
 background:rgba(255,85,85,.12);border:1px solid rgba(255,85,85,.4);color:#ff9b9b;
 font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word}
 .errbar.show{display:block}
+.ac{position:absolute;z-index:20;background:#12151f;border:1px solid var(--border2);border-radius:8px;
+box-shadow:0 12px 28px rgba(0,0,0,.55);overflow:auto;max-height:220px;min-width:190px;
+font:13px ui-monospace,Menlo,Consolas,monospace}
+.ac[hidden]{display:none}
+.aci{display:flex;justify-content:space-between;gap:1.2rem;padding:.32rem .6rem;color:#e7e9f3;cursor:pointer;white-space:nowrap}
+.aci.on,.aci:hover{background:var(--purple);color:#12131a}
+.acd{color:#7e88a8;font-size:11px}.aci.on .acd{color:#2a1a40}
 .toolbar{display:flex;flex-wrap:wrap;gap:.55rem;margin-top:.8rem}
 button,.btn{font:600 15px/1 system-ui,sans-serif;cursor:pointer;border:none;border-radius:10px;
 padding:.75rem 1.1rem;color:var(--btn-text);background:var(--purple);display:inline-flex;align-items:center;
@@ -1188,11 +1227,17 @@ transition:transform .12s,border-color .12s}
 .gtitle{font-weight:600;font-size:.9rem;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .gactions{display:flex;align-items:center;gap:.5rem;flex:none}
 .gopen{font-size:.8rem;white-space:nowrap;color:var(--cyan)}
-.likebtn{background:transparent;border:1px solid var(--border2);color:var(--muted);
+.likebtn,.sharebtn,.delbtn{background:transparent;border:1px solid var(--border2);color:var(--muted);
 font:600 .78rem system-ui,sans-serif;padding:.22rem .55rem;border-radius:999px;cursor:pointer;
 display:inline-flex;align-items:center;gap:.15rem;transition:color .12s,border-color .12s}
 .likebtn:hover,.likebtn.liked{color:var(--pink);border-color:var(--pink)}
-.likebtn[disabled]{cursor:default}
+.sharebtn:hover{color:var(--cyan);border-color:var(--cyan)}
+.delbtn:hover{color:#ff5555;border-color:#ff5555}
+.likebtn[disabled],.delbtn[disabled]{cursor:default;opacity:.6}
+.creation-view{max-width:680px;margin:0 auto;background:linear-gradient(180deg,var(--panel),var(--bg2));
+border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;box-shadow:0 12px 30px rgba(0,0,0,.35)}
+.creation-view .gthumb img{aspect-ratio:3/2;object-fit:contain}
+.creation-view .gcap{justify-content:center}
 ")
 
 ;; Served from /app.js (CSP script-src 'self'), so it can use < > & freely.
@@ -1263,6 +1308,86 @@ display:inline-flex;align-items:center;gap:.15rem;transition:color .12s,border-c
     if (gutter && ta){ gutter.scrollTop = ta.scrollTop; }
   }
 
+  // ---- command autocomplete ----------------------------------------------
+  var AC_LIST = Object.keys(KW).sort();
+  var AC_DESC = {
+    circle:'x y r culoare', rect:'x y w h c', ellipse:'cx cy rx ry c',
+    line:'x1 y1 x2 y2 c gros', ring:'cx cy r c gros', arc:'cx cy r a0 a1 c gros',
+    triangle:'x1 y1 x2 y2 x3 y3 c', poly:'cx cy laturi r c', heart:'cx cy marime c',
+    sector:'cx cy r a0 a1 c', spiral:'cx cy ture r0 r1 c gros', curve:'c gros x1 y1 ...',
+    polygon:'c x1 y1 ...', polyline:'c gros x1 y1 ...', star:'cx cy varfuri rext rint c',
+    text:'x y marime c "STR"', bg:'culoare',
+    repeat:'N cmd...', 'for':'nume a b [pas] cmd...', grid:'col rand cmd... (gx gy gi)',
+    'let':'([nume val] ...) cmd...', seed:'N',
+    group:'cmd...', rotate:'grd cx cy cmd...', translate:'dx dy cmd...', scale:'sx sy cmd...',
+    opacity:'a cmd...', spin:'cx cy sec cmd...', pulse:'sec cmd...',
+    blur:'px cmd...', glow:'culoare cmd...', shadow:'dx dy px c cmd...',
+    stroke:'c gros cmd...', dash:'on off cmd...',
+    rgb:'r g b', rgba:'r g b a', hsl:'h s l', hsla:'h s l a', hsv:'h s v',
+    mix:'c1 c2 t', palette:'"nume" i', linear:'grd c1 c2 ... (umplere)', radial:'c1 c2 ... (umplere)',
+    noise:'x y', lerp:'a b t', clamp:'x lo hi', map:'v il ih ol oh',
+    random:'max | lo hi', hypot:'a b', dist:'x1 y1 x2 y2'
+  };
+  var acBox = null, acItems = [], acActive = -1, acStart = -1;
+  var charW = 0, lineH = 0, padL = 0, padT = 0;
+  function acMetrics(){
+    if (charW || !ta) return;
+    var cs = getComputedStyle(ta);
+    lineH = parseFloat(cs.lineHeight) || 21;
+    padL = parseFloat(cs.paddingLeft) || 0; padT = parseFloat(cs.paddingTop) || 0;
+    var s = document.createElement('span'); s.textContent = '0000000000';
+    s.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;font:' + cs.font;
+    document.body.appendChild(s); charW = s.getBoundingClientRect().width / 10; s.remove();
+  }
+  function acGetBox(){
+    if (!acBox){ acBox = document.createElement('div'); acBox.className = 'ac'; acBox.setAttribute('hidden','');
+      (document.getElementById('editorWrap') || document.body).appendChild(acBox); }
+    return acBox;
+  }
+  function acClose(){ if (acBox) acBox.setAttribute('hidden',''); acItems = []; acActive = -1; acStart = -1; }
+  function acOpen(){ return acBox && !acBox.hasAttribute('hidden') && acItems.length; }
+  function acHighlight(){
+    if (!acBox) return;
+    var kids = acBox.children;
+    for (var i = 0; i < kids.length; i++) kids[i].className = 'aci' + (i === acActive ? ' on' : '');
+  }
+  function acCurrentWord(){
+    if (!ta || ta.selectionStart !== ta.selectionEnd) return null;
+    var v = ta.value, i = ta.selectionStart;
+    var ls = v.lastIndexOf('\n', i - 1) + 1;
+    var line = v.slice(ls, i);
+    if (line.indexOf(';') >= 0) return null;                 // comment
+    if (((line.match(/"/g) || []).length) % 2 === 1) return null;  // inside string
+    var m = /[a-zA-Z][a-zA-Z0-9?*+\/<>=!-]*$/.exec(line);
+    return m ? { word: m[0], start: i - m[0].length, end: i } : null;
+  }
+  function acUpdate(){
+    var cw = acCurrentWord();
+    if (!cw){ acClose(); return; }
+    var w = cw.word.toLowerCase();
+    var matches = AC_LIST.filter(function(k){ return k.indexOf(w) === 0 && k !== w; }).slice(0, 8);
+    if (!matches.length){ acClose(); return; }
+    acItems = matches; acActive = 0; acStart = cw.start; acMetrics();
+    var before = ta.value.slice(0, cw.end);
+    var row = (before.match(/\n/g) || []).length;
+    var col = before.length - (before.lastIndexOf('\n') + 1);
+    var box = acGetBox();
+    box.innerHTML = matches.map(function(k, idx){
+      var d = AC_DESC[k] ? '<span class="acd">' + esc(AC_DESC[k]) + '</span>' : '';
+      return '<div class="aci' + (idx === 0 ? ' on' : '') + '" data-i="' + idx + '">' + esc(k) + d + '</div>';
+    }).join('');
+    box.style.left = Math.max(2, padL + (col - cw.word.length) * charW - ta.scrollLeft) + 'px';
+    box.style.top = (padT + (row + 1) * lineH - ta.scrollTop + 3) + 'px';
+    box.removeAttribute('hidden');
+  }
+  function acAccept(){
+    if (acActive < 0 || !acItems.length) return false;
+    var k = acItems[acActive], v = ta.value, end = ta.selectionStart;
+    ta.value = v.slice(0, acStart) + k + v.slice(end);
+    ta.selectionStart = ta.selectionEnd = acStart + k.length;
+    acClose(); syncEditor(); scheduleRender(); return true;
+  }
+
   // ---- live render -------------------------------------------------------
   var inflight = false, pending = false;
   function render(){
@@ -1301,9 +1426,22 @@ display:inline-flex;align-items:center;gap:.15rem;transition:color .12s,border-c
   var PAIRS = { '(' : ')', '"' : '"' };
 
   if (ta){
-    ta.addEventListener('input', function(){ syncEditor(); scheduleRender(); });
-    ta.addEventListener('scroll', syncScroll);
+    ta.addEventListener('input', function(){ syncEditor(); scheduleRender(); acUpdate(); });
+    ta.addEventListener('scroll', function(){ syncScroll(); acClose(); });
+    ta.addEventListener('blur', function(){ setTimeout(acClose, 120); });
+    // accept a suggestion by clicking it (mousedown beats the textarea blur)
+    acGetBox().addEventListener('mousedown', function(e){
+      var it = e.target && e.target.closest ? e.target.closest('.aci') : null;
+      if (it){ e.preventDefault(); acActive = parseInt(it.getAttribute('data-i'), 10); acAccept(); ta.focus(); }
+    });
     ta.addEventListener('keydown', function(e){
+      // when the autocomplete popup is open it owns the arrows/enter/tab/esc
+      if (acOpen()){
+        if (e.key === 'ArrowDown'){ e.preventDefault(); acActive = (acActive + 1) % acItems.length; acHighlight(); return; }
+        if (e.key === 'ArrowUp'){ e.preventDefault(); acActive = (acActive - 1 + acItems.length) % acItems.length; acHighlight(); return; }
+        if (e.key === 'Enter' || e.key === 'Tab'){ e.preventDefault(); acAccept(); return; }
+        if (e.key === 'Escape'){ e.preventDefault(); acClose(); return; }
+      }
       var s = ta.selectionStart, en = ta.selectionEnd, v = ta.value;
       if ((e.ctrlKey || e.metaKey) && e.key === 'Enter'){ e.preventDefault(); clearTimeout(deb); render(); return; }
       if (e.key === 'Tab'){ e.preventDefault();
@@ -1406,7 +1544,17 @@ display:inline-flex;align-items:center;gap:.15rem;transition:color .12s,border-c
     function(s){ return '(bg "#0b0f1a")\n(seed ' + s + ')\n(spin 300 200 ' + ri(16,38) + '\n  (repeat ' + ri(70,140) + '\n    (circle (+ 300 (* (* i 2.2) (cos (* i ' + rf(0.2,0.45) + ')))) (+ 200 (* (* i 2.2) (sin (* i ' + rf(0.2,0.45) + ')))) 6 (hsl (* i ' + ri(3,8) + ') 85 60))))'; },
     function(s){ return '(radial-bg "#fff3b0" "#ff8c42" "#1a0b2e")\n(seed ' + s + ')\n(repeat 12\n  (rotate (* i 30) 300 200\n    (repeat 14\n      (star (+ 300 (* i 16)) 200 5 10 4 (hsla (* i 24) 80 62 0.7)))))'; },
     function(s){ return '(bg "#05070f")\n(seed ' + s + ')\n(repeat 90\n  (let ([a (* i 0.18)] [r (* 170 (cos (* ' + ri(3,7) + ' (* i 0.18))))])\n    (circle (+ 300 (* r (cos a))) (+ 200 (* r (sin a))) 5 (mix "#50fa7b" "#8be9fd" (map i 0 90 0 1)))))'; },
-    function(s){ return '(linear-bg 90 "#0a0a12" "#161032")\n(seed ' + s + ')\n(pulse 3\n  (repeat 60\n    (ring (random 600) (random 400) (random 6 40) (hsl (random 360) 75 62) 2)))'; }
+    function(s){ return '(linear-bg 90 "#0a0a12" "#161032")\n(seed ' + s + ')\n(pulse 3\n  (repeat 60\n    (ring (random 600) (random 400) (random 6 40) (hsl (random 360) 75 62) 2)))'; },
+    // mandala: grid of rotated polygons filled with a gradient
+    function(s){ var pal=['aurora','candy','ice','lava','retro'][ri(0,4)];
+      return '(bg "#05060d")\n(seed ' + s + ')\n(repeat ' + ri(10,16) + '\n  (rotate (* i ' + ri(12,30) + ') 300 200\n    (poly 300 ' + ri(60,120) + ' ' + ri(3,8) + ' ' + ri(30,70) + '\n          (linear (* i 30) (palette "' + pal + '" (mod i 6)) "#05060d"))))'; },
+    // starfield galaxy with a glowing core
+    function(s){ return '(radial-bg "#0a0618" "#000")\n(seed ' + s + ')\n(repeat 1000\n  (let ([a (* i ' + rf(0.1,0.3) + ')] [r (* i 0.42)])\n    (circle (+ 300 (* r (cos a))) (+ 200 (* r (sin a))) (random 1 3)\n            (palette "' + ['neon','ice','candy'][ri(0,2)] + '" (random 6)))))\n(glow "#8be9fd" (circle 300 200 ' + ri(10,22) + ' "#eafbff"))'; },
+    // stacked smooth waves (ocean / aurora)
+    function(s){ var pal=['ocean','aurora','sunset'][ri(0,2)];
+      return '(linear-bg 90 "#02121e" "#06263a")\n(seed ' + s + ')\n(repeat ' + ri(7,12) + '\n  (let ([o (* i ' + ri(10,20) + ')])\n    (curve (palette "' + pal + '" (mod (+ i 1) 6)) ' + ri(2,4) + '\n      0 (+ 180 o) 150 (+ ' + ri(120,200) + ' o) 300 (+ 190 o) 450 (+ ' + ri(130,210) + ' o) 600 (+ 180 o))))'; },
+    // fireworks: radiating lines from several bursts
+    function(s){ return '(bg "#04030a")\n(seed ' + s + ')\n(repeat ' + ri(5,9) + '\n  (let ([cx (random 120 480)] [cy (random 80 300)] [h (random 360)])\n    (glow (hsv h 85 95)\n      (for a 0 360 ' + ri(12,24) + '\n        (line cx cy (+ cx (* ' + ri(40,90) + ' (cos (* a 0.0175)))) (+ cy (* ' + ri(40,90) + ' (sin (* a 0.0175)))) (hsv (+ h a) 80 95) 2)))))'; }
   ];
   bind('btnSurprise', function(){
     if (!ta) return;
@@ -1428,23 +1576,44 @@ display:inline-flex;align-items:center;gap:.15rem;transition:color .12s,border-c
   if (f){ f.addEventListener('change', function(){ var n = document.getElementById('fname');
     if (n){ n.textContent = f.files[0] ? f.files[0].name : ''; } }); }
 
-  // ---- gallery: like buttons (event delegation; no-op off the gallery) ----
+  // ---- gallery actions: like / share / delete (delegated; no-op elsewhere) -
+  function adminToken(){
+    try { return new URLSearchParams(location.search).get('admin') || ''; } catch(e){ return ''; }
+  }
   document.addEventListener('click', function(e){
-    var btn = e.target && e.target.closest ? e.target.closest('.likebtn') : null;
-    if (!btn || btn.disabled) return;
-    var id = btn.getAttribute('data-id'); if (!id) return;
-    btn.disabled = true;
-    fetch('/api/like', { method:'POST',
-        headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
-        body:'id=' + encodeURIComponent(id) })
-      .then(function(r){ return r.json(); })
-      .then(function(o){
-        var cnt = btn.querySelector('.likecount');
-        if (o && typeof o.likes === 'number' && cnt) cnt.textContent = o.likes;
-        btn.classList.add('liked');
-        if (o && !o.ok) toast('Ai apreciat deja asta');
-      })
-      .catch(function(){ btn.disabled = false; });
+    if (!e.target || !e.target.closest) return;
+    var like = e.target.closest('.likebtn');
+    if (like && !like.disabled){
+      var id = like.getAttribute('data-id'); if (!id) return;
+      like.disabled = true;
+      fetch('/api/like', { method:'POST', headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
+          body:'id=' + encodeURIComponent(id) })
+        .then(function(r){ return r.json(); })
+        .then(function(o){ var cnt = like.querySelector('.likecount');
+          if (o && typeof o.likes === 'number' && cnt) cnt.textContent = o.likes;
+          like.classList.add('liked'); if (o && !o.ok) toast('Ai apreciat deja asta'); })
+        .catch(function(){ like.disabled = false; });
+      return;
+    }
+    var share = e.target.closest('.sharebtn');
+    if (share){
+      var sid = share.getAttribute('data-id'); if (!sid) return;
+      copyText(location.origin + '/g/' + sid, 'Link catre creatie copiat');
+      return;
+    }
+    var del = e.target.closest('.delbtn');
+    if (del && !del.disabled){
+      var did = del.getAttribute('data-id'); if (!did) return;
+      if (!confirm('Stergi aceasta creatie definitiv?')) return;
+      del.disabled = true;
+      fetch('/api/delete', { method:'POST', headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
+          body:'id=' + encodeURIComponent(did) + '&token=' + encodeURIComponent(adminToken()) })
+        .then(function(r){ return r.json(); })
+        .then(function(o){ if (o && o.ok){ var card = document.querySelector('[data-card="'+did+'"]');
+            if (card) card.remove(); toast('Creatie stearsa'); }
+          else { del.disabled = false; toast('Nu am putut sterge'); } })
+        .catch(function(){ del.disabled = false; toast('Eroare la stergere'); });
+    }
   });
 
   // ---- enable the pro editor + surface any errors already on the canvas --
@@ -1510,6 +1679,7 @@ ENDJS
         (ul ,@(for/list ([it (in-list items)]) `(li (code ,it))))))
 
 ;; Shared bits so the gallery page matches the editor page's chrome.
+(define SITE-ORIGIN "https://racket.micutu.com")
 (define FAVICON-HREF
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0d14'/%3E%3Ccircle cx='16' cy='16' r='9' fill='%23bd93f9'/%3E%3C/svg%3E")
 (define THEME-BOOT
@@ -1519,24 +1689,28 @@ ENDJS
 ;; Community gallery page.  Thumbnails are <img> to /thumb/<id> (inert SVG),
 ;; each linking back into the editor via a ?c= permalink.
 ;; ---------------------------------------------------------------------------
-(define (gallery-card row)
+(define (gallery-card row [admin #f])
   (define id (vector-ref row 0))
+  (define ids (number->string id))
   (define title (vector-ref row 1))
   (define href (string-append "/?c=" (encode-share (vector-ref row 2))))
   (define likes (if (>= (vector-length row) 4) (vector-ref row 3) 0))
-  `(figure ((class "gcard"))
-     (a ((class "gthumb") (href ,href) (title "Deschide in editor"))
+  `(figure ((class "gcard") (data-card ,ids))
+     (a ((class "gthumb") (href ,(format "/g/~a" id)) (title "Vezi creatia"))
         (img ((src ,(format "/thumb/~a" id)) (alt ,title) (loading "lazy")
               (width "600") (height "400"))))
      (figcaption ((class "gcap"))
         (span ((class "gtitle")) ,title)
         (span ((class "gactions"))
-          (button ((type "button") (class "likebtn") (data-id ,(number->string id))
-                   (aria-label "Apreciaza"))
+          (button ((type "button") (class "likebtn") (data-id ,ids) (aria-label "Apreciaza"))
                   "♥ " (span ((class "likecount")) ,(number->string likes)))
+          (button ((type "button") (class "sharebtn") (data-id ,ids) (aria-label "Copiaza link")) "🔗")
+          ,@(if admin
+                (list `(button ((type "button") (class "delbtn") (data-id ,ids) (aria-label "Sterge")) "🗑"))
+                '())
           (a ((class "gopen") (href ,href)) "Deschide ↗")))))
 
-(define (gallery-page before [sort 'recent])
+(define (gallery-page before [sort 'recent] [admin #f])
   (define rows (gallery-list before sort))
   (define last-id (and (pair? rows) (= (length rows) GALLERY-PAGE)
                        (vector-ref (last rows) 0)))
@@ -1561,6 +1735,7 @@ ENDJS
         (div ((class "badge")) "Galerie comunitara")
         (h1 "Creatii salvate")
         (p "Arta trimisa de vizitatori. Apasa o miniatura ca sa o deschizi si sa o modifici in editor.")
+        ,@(if admin (list `(p ((class "flash") (style "text-align:center")) "Mod moderare activ — poti sterge creatii.")) '())
         (p ((class "heronav"))
            (a ((href "/") (class "btn btn-ghost")) "← Inapoi la editor")
            " "
@@ -1571,7 +1746,7 @@ ENDJS
         ,(if (null? rows)
              `(p ((class "hint") (style "text-align:center;padding:2rem 0"))
                  "Inca nu exista creatii salvate. Fii primul: randeaza ceva in editor si apasa „Salveaza in galerie”.")
-             `(div ((class "gallery")) ,@(map gallery-card rows)))
+             `(div ((class "gallery")) ,@(map (lambda (r) (gallery-card r admin)) rows)))
         ,@(if (and last-id (not (eq? sort 'popular)))
               (list `(p ((style "text-align:center;margin-top:1.4rem"))
                         (a ((href ,(format "/gallery?before=~a" last-id)) (class "btn btn-ghost"))
@@ -1580,6 +1755,63 @@ ENDJS
        (footer
         (p "Procedural Canvas DSL · "
            (a ((href "/")) "editor"))))))))
+
+;; ---------------------------------------------------------------------------
+;; Per-creation share page — its own Open Graph preview (the SVG thumbnail).
+;; ---------------------------------------------------------------------------
+(define (creation-page row)
+  (define id (vector-ref row 0))
+  (define title (vector-ref row 1))
+  (define code (vector-ref row 2))
+  (define likes (if (>= (vector-length row) 4) (vector-ref row 3) 0))
+  (define ids (number->string id))
+  (define page-url (format "~a/g/~a" SITE-ORIGIN id))
+  (define img-url (format "~a/thumb/~a" SITE-ORIGIN id))
+  (define href (string-append "/?c=" (encode-share code)))
+  (response/xexpr
+   #:preamble #"<!DOCTYPE html>"
+   `(html ((lang "ro"))
+     (head
+      (meta ((charset "utf-8")))
+      (title ,(string-append title " — Procedural Canvas DSL"))
+      (meta ((name "viewport") (content "width=device-width, initial-scale=1")))
+      (meta ((name "color-scheme") (content "dark light")))
+      (meta ((name "theme-color") (content "#0b0d14")))
+      (meta ((name "description") (content ,(string-append "„" title "” — o creatie generativa facuta cu Procedural Canvas DSL."))))
+      (link ((rel "canonical") (href ,page-url)))
+      (meta ((property "og:type") (content "article")))
+      (meta ((property "og:site_name") (content "Procedural Canvas DSL")))
+      (meta ((property "og:title") (content ,title)))
+      (meta ((property "og:description") (content "O creatie generativa din galeria Procedural Canvas DSL.")))
+      (meta ((property "og:url") (content ,page-url)))
+      (meta ((property "og:image") (content ,img-url)))
+      (meta ((name "twitter:card") (content "summary_large_image")))
+      (meta ((name "twitter:title") (content ,title)))
+      (meta ((name "twitter:image") (content ,img-url)))
+      (link ((rel "icon") (href ,FAVICON-HREF)))
+      (style ,PAGE-CSS)
+      (script ,THEME-BOOT)
+      (script ((src ,(string-append "/app.js?v=" APP-JS-VER)) (defer "defer"))))
+     (body
+      (div ((class "wrap"))
+       (header ((class "hero"))
+        (div ((class "badge")) "Creatie din galerie")
+        (h1 ,title)
+        (p ((class "heronav"))
+           (a ((href "/gallery") (class "btn btn-ghost")) "← Galerie")
+           " " (a ((href ,href) (class "btn btn-cyan")) "✎ Deschide in editor")))
+       (main ((id "main"))
+        (figure ((class "creation-view") (data-card ,ids))
+         (a ((class "gthumb") (href ,href) (title "Deschide in editor"))
+            (img ((src ,(format "/thumb/~a" id)) (alt ,title) (width "600") (height "400"))))
+         (figcaption ((class "gcap"))
+           (span ((class "gactions"))
+             (button ((type "button") (class "likebtn") (data-id ,ids) (aria-label "Apreciaza"))
+                     "♥ " (span ((class "likecount")) ,(number->string likes)))
+             (button ((type "button") (class "sharebtn") (data-id ,ids) (aria-label "Copiaza link")) "🔗 Copiaza link")))))
+       (footer
+        (p "Procedural Canvas DSL · "
+           (a ((href "/")) "editor") " · " (a ((href "/gallery")) "galerie"))))))))
 
 (define (start req)
   ;; The web-server body parser throws on malformed / non-UTF-8 form bodies;
@@ -1647,6 +1879,21 @@ ENDJS
                     (list (string->bytes/utf-8
                            (jsexpr->string (hasheq 'ok (and likes #t) 'likes (or likes 0))))))]
 
+    ;; Admin-only delete (requires the secret token; disabled if unset).
+    [(equal? (req-path req) "api/delete")
+     (define tok (extract-form-value #"token"))
+     (define ok? (and (admin? tok)
+                      (gallery-delete! (string->number (extract-form-value #"id")))))
+     (response/full 200 #"OK" (current-seconds) #"application/json; charset=utf-8"
+                    (list (make-header #"Cache-Control" #"no-store"))
+                    (list (string->bytes/utf-8 (jsexpr->string (hasheq 'ok (and ok? #t))))))]
+
+    ;; Per-creation share page (its own Open Graph preview).
+    [(regexp-match #px"^g/([0-9]{1,12})$" (req-path req))
+     => (lambda (m)
+          (define row (gallery-get (string->number (cadr m))))
+          (if row (creation-page row) (gallery-page #f 'recent)))]
+
     ;; JSON save endpoint for the no-reload save button (same caps as the form).
     [(equal? (req-path req) "api/save")
      (define-values (ok? msg)
@@ -1669,7 +1916,8 @@ ENDJS
     [(equal? (req-path req) "gallery")
      (define before (string->number (extract-form-value #"before")))
      (define sort (if (equal? (extract-form-value #"sort") "popular") 'popular 'recent))
-     (gallery-page (and (exact-integer? before) before) sort)]
+     (gallery-page (and (exact-integer? before) before) sort
+                   (admin? (extract-form-value #"admin")))]
 
     [else
      (define action (extract-form-value #"action"))
@@ -1850,6 +2098,7 @@ ENDJS
                   (list "#rrggbb" "nume-css (red...)" "(rgb r g b)" "(rgba r g b a)"
                         "(hsl h s l)" "(hsla h s l a)" "(hsv h s v)" "(mix c1 c2 t)"
                         "(palette \"nume\" i)" "fire ocean neon pastel sunset forest"
+                        "ice lava candy earth aurora retro mono"
                         "(linear grd c1 c2 ...) ← umplere" "(radial c1 c2 ...) ← umplere"
                         "(linear-bg grd c1 c2 ...)" "(radial-bg c1 c2 ...)"))))
              ) ; /main
@@ -2107,4 +2356,31 @@ ENDJS
       (check-false (gallery-like! 999999999 "voter-z")) ; missing id
       ;; A (2 likes) now outranks B (0) in the popular view
       (define pop (gallery-list #f 'popular))
-      (check-equal? (vector-ref (car pop) 0) idA))))
+      (check-equal? (vector-ref (car pop) 0) idA)))
+
+  ;; --- round 9: admin moderation, per-creation page, palettes ---------------
+  (test-case "admin? only matches a configured, non-empty token"
+    ;; ADMIN-TOKEN is unset in the test env, so admin is disabled for any input
+    (check-false (admin? ""))
+    (check-false (admin? "anything"))
+    (check-false (admin? #f)))
+
+  (test-case "gallery-get / delete work and delete is bounded to real rows"
+    (when (gallery-db)
+      (define art "(bg \"#010\")(circle 1 1 1 \"red\")(circle 2 2 2 \"blue\")")
+      (define-values (ok _m) (gallery-save! "delobj" art (format "d~a" (current-milliseconds))))
+      (check-true ok)
+      (define id (vector-ref (car (gallery-list #f 'recent)) 0))
+      (define row (gallery-get id))
+      (check-equal? (vector-ref row 1) "delobj")
+      (check-false (gallery-delete! 999999999))   ; no such row
+      (check-true (gallery-delete! id))            ; real row
+      (check-false (gallery-get id))))             ; gone
+
+  (test-case "per-creation page carries Open Graph meta for the thumbnail"
+    (define resp (creation-page (vector 42 "Opera mea" "(circle 1 1 1 \"red\")" 3)))
+    (check-true (response? resp)))
+
+  (test-case "new palettes resolve"
+    (for ([name (in-list '("ice" "lava" "candy" "earth" "aurora" "retro"))])
+      (check-true (regexp-match? #px"^#[0-9a-fA-F]{6}$" (palette-color name 2))))))
