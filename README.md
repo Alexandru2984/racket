@@ -94,7 +94,7 @@ Constants: `pi  tau  width  height`.
 | Builder | Meaning |
 | --- | --- |
 | `(hsv h s v)` | HSV color (hue 0–360, sat/value 0–100) |
-| `(palette "name" i)` | curated palette color: fire, ocean, neon, pastel, sunset, forest, mono |
+| `(palette "name" i)` | curated palette: fire, ocean, neon, pastel, sunset, forest, mono, ice, lava, candy, earth, aurora, retro |
 | `(mix c1 c2 t)` | blend any two colors in RGB at `t` in `[0,1]` |
 | `(linear angle c1 c2 ...)` | gradient **fill** for a shape (per-shape, any shape) |
 | `(radial c1 c2 ...)` | radial gradient fill for a shape |
@@ -120,18 +120,20 @@ Constants: `pi  tau  width  height`.
 - **Live preview** — the editor renders as you type (debounced); `Ctrl+Enter`
   renders now, `Tab` indents. A status line shows element count and render time.
 - **Pro editor** — syntax highlighting, a line-number gutter, auto-closing
-  parens/quotes and an inline error bar, all as progressive enhancement over a
-  plain textarea.
+  parens/quotes, an inline error bar and command autocomplete (caret-anchored,
+  keyboard-navigable), all as progressive enhancement over a plain textarea.
 - **Export** — download the art as **SVG** (server) or **PNG** (client-side
   canvas rasterization at 2×).
 - **Share** — the 🔗 button builds a `?c=<base64>` permalink of the current
   program and copies it to the clipboard.
 - **Surprise** — five seeded generators (flow field, vortex, kaleidoscope,
   polar rose, pulsing rings) produce new art in one click.
-- **Community gallery** — save a creation and browse everyone's work; each
-  thumbnail opens back in the editor via a permalink, with one-tap ♥ likes
-  (one per IP) and a recent/popular toggle. Public and unauthenticated, so it
-  is bounded on every axis (see below).
+- **Community gallery** — save a creation and browse everyone's work, with
+  one-tap ♥ likes (one per IP), a recent/popular toggle, and a per-creation
+  share page (`/g/<id>`) that carries its own Open Graph preview. Public and
+  unauthenticated, so it is bounded on every axis (see below). Optional
+  moderation: set `GALLERY_ADMIN_TOKEN` and visit `/gallery?admin=<token>` to
+  delete entries; admin is fully off when the token is unset.
 - **Image → DSL** — upload a JPG/PNG and get editable DSL circles back.
 - **Light / dark theme** — 🌓 toggle, persisted in `localStorage` and applied
   before first paint (the editor and canvas stay dark by design).
@@ -149,7 +151,9 @@ Constants: `pi  tau  width  height`.
 | `POST /api/render` | render `code` to SVG; `X-Render-Ms` / `X-Elements` headers |
 | `POST /api/save` | save a creation (JSON), for the no-reload save button |
 | `POST /api/like` | like a creation once per IP (JSON) |
+| `POST /api/delete` | admin-only delete (requires `GALLERY_ADMIN_TOKEN`) |
 | `GET /gallery?sort=popular` | gallery ordered by likes |
+| `GET /g/<id>` | per-creation share page (own Open Graph preview) |
 | `POST /` + `action=save` | save a creation to the gallery (303 → `/gallery`; no-JS fallback) |
 | `GET /gallery` | the community gallery (paginated via `?before=<id>`) |
 | `GET /thumb/<id>` | a saved creation's thumbnail, as an inert SVG image |
