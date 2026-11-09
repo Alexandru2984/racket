@@ -952,6 +952,14 @@
                        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
                        "title TEXT NOT NULL, code TEXT NOT NULL, svg TEXT NOT NULL,"
                        "created INTEGER NOT NULL, ip TEXT)"))
+        ;; migration: add the likes column (ignored if it already exists) and a
+        ;; dedup table so each IP can like a creation only once.
+        (with-handlers ([exn:fail? void])
+          (query-exec c "ALTER TABLE creations ADD COLUMN likes INTEGER NOT NULL DEFAULT 0"))
+        (query-exec c (string-append
+                       "CREATE TABLE IF NOT EXISTS likes_log("
+                       "creation INTEGER NOT NULL, ip TEXT NOT NULL,"
+                       "PRIMARY KEY(creation, ip))"))
         (set! gallery-conn c)
         c)))
 
@@ -993,11 +1001,14 @@
               (query-exec c (string-append
                              "DELETE FROM creations WHERE id NOT IN "
                              "(SELECT id FROM creations ORDER BY id DESC LIMIT ?)") MAX-GALLERY)
+              ;; drop likes for evicted creations so likes_log stays bounded
+              (query-exec c "DELETE FROM likes_log WHERE creation NOT IN (SELECT id FROM creations)")
               (hash-set! ip-last ip now)
               (values #t "Salvat in galerie!"))])]))))
 
-;; Latest creations (id, title, code), optionally older than `before`.
-(define (gallery-list before)
+;; Creations as (id, title, code, likes).  sort 'popular orders by likes then
+;; recency and ignores `before`; otherwise newest-first with keyset pagination.
+(define (gallery-list before [sort 'recent])
   (define c (gallery-db))
   (cond
     [(not c) '()]
@@ -1005,9 +1016,13 @@
      (with-handlers ([exn:fail? (lambda (_) '())])
        (call-with-semaphore gallery-lock
          (lambda ()
-           (if (and before (exact-integer? before))
-               (query-rows c "SELECT id,title,code FROM creations WHERE id<? ORDER BY id DESC LIMIT ?" before GALLERY-PAGE)
-               (query-rows c "SELECT id,title,code FROM creations ORDER BY id DESC LIMIT ?" GALLERY-PAGE)))))]))
+           (cond
+             [(eq? sort 'popular)
+              (query-rows c "SELECT id,title,code,likes FROM creations ORDER BY likes DESC, id DESC LIMIT ?" GALLERY-PAGE)]
+             [(and before (exact-integer? before))
+              (query-rows c "SELECT id,title,code,likes FROM creations WHERE id<? ORDER BY id DESC LIMIT ?" before GALLERY-PAGE)]
+             [else
+              (query-rows c "SELECT id,title,code,likes FROM creations ORDER BY id DESC LIMIT ?" GALLERY-PAGE)]))))]))
 
 ;; Stored thumbnail SVG for an id, or #f.
 (define (gallery-svg id)
@@ -1018,6 +1033,22 @@
            (lambda ()
              (define r (query-maybe-value c "SELECT svg FROM creations WHERE id=?" id))
              (and (string? r) r))))))
+
+;; Like a creation once per IP.  Returns the new like count, or #f if the
+;; creation is gone, the IP already liked it, or the DB is unavailable.
+(define (gallery-like! id ip)
+  (define c (gallery-db))
+  (and c (exact-integer? id)
+       (with-handlers ([exn:fail? (lambda (_) #f)])
+         (call-with-semaphore gallery-lock
+           (lambda ()
+             (cond
+               [(not (query-maybe-value c "SELECT 1 FROM creations WHERE id=?" id)) #f]
+               [(query-maybe-value c "SELECT 1 FROM likes_log WHERE creation=? AND ip=?" id (or ip "")) #f]
+               [else
+                (query-exec c "INSERT INTO likes_log(creation,ip) VALUES (?,?)" id (or ip ""))
+                (query-exec c "UPDATE creations SET likes=likes+1 WHERE id=?" id)
+                (query-value c "SELECT likes FROM creations WHERE id=?" id)]))))))
 
 (define DEFAULT-CODE
   (string-append
@@ -1155,7 +1186,13 @@ transition:transform .12s,border-color .12s}
 .gthumb img{width:100%;height:auto;display:block;aspect-ratio:3/2;object-fit:contain}
 .gcap{display:flex;align-items:center;justify-content:space-between;gap:.5rem;padding:.6rem .8rem}
 .gtitle{font-weight:600;font-size:.9rem;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.gactions{display:flex;align-items:center;gap:.5rem;flex:none}
 .gopen{font-size:.8rem;white-space:nowrap;color:var(--cyan)}
+.likebtn{background:transparent;border:1px solid var(--border2);color:var(--muted);
+font:600 .78rem system-ui,sans-serif;padding:.22rem .55rem;border-radius:999px;cursor:pointer;
+display:inline-flex;align-items:center;gap:.15rem;transition:color .12s,border-color .12s}
+.likebtn:hover,.likebtn.liked{color:var(--pink);border-color:var(--pink)}
+.likebtn[disabled]{cursor:default}
 ")
 
 ;; Served from /app.js (CSP script-src 'self'), so it can use < > & freely.
@@ -1391,6 +1428,25 @@ transition:transform .12s,border-color .12s}
   if (f){ f.addEventListener('change', function(){ var n = document.getElementById('fname');
     if (n){ n.textContent = f.files[0] ? f.files[0].name : ''; } }); }
 
+  // ---- gallery: like buttons (event delegation; no-op off the gallery) ----
+  document.addEventListener('click', function(e){
+    var btn = e.target && e.target.closest ? e.target.closest('.likebtn') : null;
+    if (!btn || btn.disabled) return;
+    var id = btn.getAttribute('data-id'); if (!id) return;
+    btn.disabled = true;
+    fetch('/api/like', { method:'POST',
+        headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
+        body:'id=' + encodeURIComponent(id) })
+      .then(function(r){ return r.json(); })
+      .then(function(o){
+        var cnt = btn.querySelector('.likecount');
+        if (o && typeof o.likes === 'number' && cnt) cnt.textContent = o.likes;
+        btn.classList.add('liked');
+        if (o && !o.ok) toast('Ai apreciat deja asta');
+      })
+      .catch(function(){ btn.disabled = false; });
+  });
+
   // ---- enable the pro editor + surface any errors already on the canvas --
   if (ta && hl && hlcode){ document.body.classList.add('hl-on'); syncEditor(); }
   showErrors();
@@ -1467,16 +1523,21 @@ ENDJS
   (define id (vector-ref row 0))
   (define title (vector-ref row 1))
   (define href (string-append "/?c=" (encode-share (vector-ref row 2))))
+  (define likes (if (>= (vector-length row) 4) (vector-ref row 3) 0))
   `(figure ((class "gcard"))
      (a ((class "gthumb") (href ,href) (title "Deschide in editor"))
         (img ((src ,(format "/thumb/~a" id)) (alt ,title) (loading "lazy")
               (width "600") (height "400"))))
      (figcaption ((class "gcap"))
         (span ((class "gtitle")) ,title)
-        (a ((class "gopen") (href ,href)) "Deschide ↗"))))
+        (span ((class "gactions"))
+          (button ((type "button") (class "likebtn") (data-id ,(number->string id))
+                   (aria-label "Apreciaza"))
+                  "♥ " (span ((class "likecount")) ,(number->string likes)))
+          (a ((class "gopen") (href ,href)) "Deschide ↗")))))
 
-(define (gallery-page before)
-  (define rows (gallery-list before))
+(define (gallery-page before [sort 'recent])
+  (define rows (gallery-list before sort))
   (define last-id (and (pair? rows) (= (length rows) GALLERY-PAGE)
                        (vector-ref (last rows) 0)))
   (response/xexpr
@@ -1492,20 +1553,26 @@ ENDJS
       (link ((rel "canonical") (href "https://racket.micutu.com/gallery")))
       (link ((rel "icon") (href ,FAVICON-HREF)))
       (style ,PAGE-CSS)
-      (script ,THEME-BOOT))
+      (script ,THEME-BOOT)
+      (script ((src ,(string-append "/app.js?v=" APP-JS-VER)) (defer "defer"))))
      (body
       (div ((class "wrap"))
        (header ((class "hero"))
         (div ((class "badge")) "Galerie comunitara")
         (h1 "Creatii salvate")
         (p "Arta trimisa de vizitatori. Apasa o miniatura ca sa o deschizi si sa o modifici in editor.")
-        (p ((class "heronav")) (a ((href "/") (class "btn btn-ghost")) "← Inapoi la editor")))
+        (p ((class "heronav"))
+           (a ((href "/") (class "btn btn-ghost")) "← Inapoi la editor")
+           " "
+           (a ((href "/gallery") (class ,(if (eq? sort 'popular) "btn btn-ghost" "btn btn-cyan"))) "Recente")
+           " "
+           (a ((href "/gallery?sort=popular") (class ,(if (eq? sort 'popular) "btn btn-cyan" "btn btn-ghost"))) "★ Populare")))
        (main ((id "main"))
         ,(if (null? rows)
              `(p ((class "hint") (style "text-align:center;padding:2rem 0"))
                  "Inca nu exista creatii salvate. Fii primul: randeaza ceva in editor si apasa „Salveaza in galerie”.")
              `(div ((class "gallery")) ,@(map gallery-card rows)))
-        ,@(if last-id
+        ,@(if (and last-id (not (eq? sort 'popular)))
               (list `(p ((style "text-align:center;margin-top:1.4rem"))
                         (a ((href ,(format "/gallery?before=~a" last-id)) (class "btn btn-ghost"))
                            "Mai vechi →")))
@@ -1572,6 +1639,14 @@ ENDJS
             (make-header #"Cache-Control" #"no-store"))
       (list (string->bytes/utf-8 (xexpr->string svg))))]
 
+    ;; Like a creation once per IP; returns the new count (JSON).
+    [(equal? (req-path req) "api/like")
+     (define likes (gallery-like! (string->number (extract-form-value #"id")) (req-ip req)))
+     (response/full 200 #"OK" (current-seconds) #"application/json; charset=utf-8"
+                    (list (make-header #"Cache-Control" #"no-store"))
+                    (list (string->bytes/utf-8
+                           (jsexpr->string (hasheq 'ok (and likes #t) 'likes (or likes 0))))))]
+
     ;; JSON save endpoint for the no-reload save button (same caps as the form).
     [(equal? (req-path req) "api/save")
      (define-values (ok? msg)
@@ -1593,7 +1668,8 @@ ENDJS
     ;; Community gallery page.
     [(equal? (req-path req) "gallery")
      (define before (string->number (extract-form-value #"before")))
-     (gallery-page (and (exact-integer? before) before))]
+     (define sort (if (equal? (extract-form-value #"sort") "popular") 'popular 'recent))
+     (gallery-page (and (exact-integer? before) before) sort)]
 
     [else
      (define action (extract-form-value #"action"))
@@ -2008,4 +2084,27 @@ ENDJS
 
   (test-case "gradient fills still obey the element/defs budget"
     (define svg (parse-to-svg "(repeat 9000 (circle 1 1 1 (radial (hsl i 80 60) \"#000\")))"))
-    (check-true (< (count-nodes svg) 70000))))
+    (check-true (< (count-nodes svg) 70000)))
+
+  ;; --- round 8: gallery likes (DB integration; skipped if DB unavailable) ---
+  (test-case "likes dedup per IP and drive the popular sort"
+    (when (gallery-db)
+      (define art "(bg \"#000\")(circle 1 1 1 \"red\")(circle 2 2 2 \"blue\")")
+      ;; unique IPs avoid the per-IP save cooldown
+      (define ip1 (format "t~a-1" (current-milliseconds)))
+      (define ip2 (format "t~a-2" (current-milliseconds)))
+      (define-values (ok1 _m1) (gallery-save! "likeobj-A" art ip1))
+      (define-values (ok2 _m2) (gallery-save! "likeobj-B" art ip2))
+      (check-true (and ok1 ok2))
+      ;; newest two rows are ours (B then A)
+      (define rows (gallery-list #f 'recent))
+      (define idB (vector-ref (car rows) 0))
+      (define idA (vector-ref (cadr rows) 0))
+      ;; like A from two voters; a repeat from the same voter is rejected
+      (check-equal? (gallery-like! idA "voter-x") 1)
+      (check-equal? (gallery-like! idA "voter-y") 2)
+      (check-false (gallery-like! idA "voter-x"))      ; dedup
+      (check-false (gallery-like! 999999999 "voter-z")) ; missing id
+      ;; A (2 likes) now outranks B (0) in the popular view
+      (define pop (gallery-list #f 'popular))
+      (check-equal? (vector-ref (car pop) 0) idA))))
