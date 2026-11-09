@@ -6,6 +6,7 @@
          net/url
          net/base64
          file/sha1
+         json
          db
          racket/draw
          racket/math
@@ -186,6 +187,14 @@
     [(list 'hsv h s v)      (match-define (list r g b) (hsv->rgb (ev h) (ev s) (ev v))) (format "rgb(~a,~a,~a)" r g b)]
     ;; (palette "name" i): pick a curated color by index.
     [(list 'palette (? string? name) i) (palette-color name (ev i))]
+    ;; Per-shape gradient paints: usable anywhere a color is (fill of any shape).
+    ;; (linear angle c1 c2 ...) and (radial c1 c2 ...) register a gradient in
+    ;; objectBoundingBox units and return its url(#id).
+    [(list* 'linear angle (and cs (cons _ _)))
+     (gradient-url 'linear cs env
+                   (list `(gradientTransform ,(format "rotate(~a 0.5 0.5)" (fmt-num (ev angle))))))]
+    [(list* 'radial (and cs (cons _ _)))
+     (gradient-url 'radial cs env)]
     ;; (mix c1 c2 t): linear RGB interpolation between any two colors at t in
     ;; [0,1] — smooth gradients across a loop without SVG <defs>.
     [(list 'mix c1 c2 t)    (match-define (list r g b) (mix-rgb c1 c2 (ev t) env)) (format "rgb(~a,~a,~a)" r g b)]
@@ -473,13 +482,19 @@
       (define off (if (= (length colors) 1) 0
                       (exact->inexact (/ k (sub1 (length colors))))))
       `(stop ((offset ,(string-append (~r (* 100 off) #:precision 1) "%")) (stop-color ,(eval-color c env))) "")))
-  (define id
-    (add-def!
-     (lambda (gid)
-       (if (eq? kind 'linear)
-           `(linearGradient ((id ,gid) ,@extra) ,@stops)
-           `(radialGradient ((id ,gid) ,@extra) ,@stops)))))
-  (format "url(#~a)" id))
+  ;; Dedup identical gradients (resolved stops + kind + extra), so a loop that
+  ;; fills thousands of shapes with the same gradient emits one <defs> entry.
+  (define cache (rctx-defcache (current-ctx)))
+  (define key (list kind stops extra))
+  (or (hash-ref cache key #f)
+      (let ([url (format "url(#~a)"
+                         (add-def!
+                          (lambda (gid)
+                            (if (eq? kind 'linear)
+                                `(linearGradient ((id ,gid) ,@extra) ,@stops)
+                                `(radialGradient ((id ,gid) ,@extra) ,@stops)))))])
+        (hash-set! cache key url)
+        url)))
 
 ;; Register an SVG <filter> (wide region so blurs/glows don't clip) built from
 ;; the given primitive nodes, and return its url(#id) reference.  Identical
@@ -636,6 +651,18 @@
          [(list* 'opacity a body)
           (spend! ctx)
           (list `(g ((opacity ,(clamp-unit (eval-num a env)))) ,@(run body env (add1 depth))))]
+         ;; Outline every shape in the body (shapes inherit stroke from the <g>
+         ;; unless they set their own).
+         [(list* 'stroke c w body)
+          (spend! ctx)
+          (list `(g ((stroke ,(col c)) (stroke-width ,(n w)) (stroke-linejoin "round"))
+                    ,@(run body env (add1 depth))))]
+         ;; Dashed strokes: on/off dash lengths (implies a stroke; pair with
+         ;; `stroke` for color, or on already-stroked shapes like line/arc).
+         [(list* 'dash on off body)
+          (spend! ctx)
+          (list `(g ((stroke-dasharray ,(format "~a,~a" (n on) (n off))))
+                    ,@(run body env (add1 depth))))]
 
          ;; --- SVG-native animation (works in the page and the downloaded file)
          [(list* 'spin cx cy dur body)
@@ -1270,7 +1297,22 @@ transition:transform .12s,border-color .12s}
   if (form){
     form.addEventListener('submit', function(e){
       var btn = e.submitter;
-      if (btn && btn.value === 'preview'){ e.preventDefault(); clearTimeout(deb); render(); }
+      if (btn && btn.value === 'preview'){ e.preventDefault(); clearTimeout(deb); render(); return; }
+      // Save without leaving the editor (no-JS falls back to the form POST).
+      if (btn && btn.value === 'save'){
+        e.preventDefault();
+        var ti = form.querySelector('input[name="title"]');
+        var title = ti ? ti.value : '';
+        btn.disabled = true;
+        fetch('/api/save', { method:'POST',
+            headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
+            body:'code=' + encodeURIComponent(ta.value) + '&title=' + encodeURIComponent(title) })
+          .then(function(r){ return r.json(); })
+          .then(function(o){ toast(o && o.msg ? o.msg : 'Salvat');
+            if (o && o.ok && ti){ ti.value = ''; } })
+          .catch(function(){ toast('Eroare la salvare'); })
+          .then(function(){ btn.disabled = false; });
+      }
     });
   }
 
@@ -1395,7 +1437,11 @@ ENDJS
    (list "Val" "curba neteda"
          "(linear-bg 90 \"#031d2e\" \"#06374f\")\n(repeat 6\n  (let ([o (* i 14)])\n    (curve (palette \"ocean\" (+ i 1)) 3\n      0 (+ 200 o) 100 (+ 150 o) 200 (+ 230 o) 300 (+ 160 o)\n      400 (+ 240 o) 500 (+ 170 o) 600 (+ 210 o))))")
    (list "Petale" "sector radial"
-         "(bg \"#0b0f1a\")\n(repeat 18\n  (rotate (* i 20) 300 200\n    (sector 300 200 160 -8 8 (hsv (* i 20) 75 95))))\n(glow \"#ffffff\" (circle 300 200 26 \"#fff3b0\"))")))
+         "(bg \"#0b0f1a\")\n(repeat 18\n  (rotate (* i 20) 300 200\n    (sector 300 200 160 -8 8 (hsv (* i 20) 75 95))))\n(glow \"#ffffff\" (circle 300 200 26 \"#fff3b0\"))")
+   (list "Bile gradient" "linear per-forma"
+         "(linear-bg 90 \"#0b0f1a\" \"#161032\")\n(repeat 30\n  (circle (random 600) (random 400) (random 20 48)\n          (linear (random 360) (palette \"neon\" (random 6)) \"#0b0f1a\")))")
+   (list "Orbite" "contur + dash"
+         "(bg \"#05070f\")\n(repeat 7\n  (stroke (hsv (* i 50) 80 95) 2\n    (dash 6 10\n      (ellipse 300 200 (+ 40 (* i 38)) (+ 24 (* i 22)) \"none\"))))\n(glow \"#f1fa8c\" (circle 300 200 14 \"#f1fa8c\"))")))
 
 (define (example-card title desc code)
   `(form ((method "post") (class "ex-form"))
@@ -1525,6 +1571,14 @@ ENDJS
             (make-header #"X-Elements" (string->bytes/utf-8 (number->string (count-svg-nodes svg))))
             (make-header #"Cache-Control" #"no-store"))
       (list (string->bytes/utf-8 (xexpr->string svg))))]
+
+    ;; JSON save endpoint for the no-reload save button (same caps as the form).
+    [(equal? (req-path req) "api/save")
+     (define-values (ok? msg)
+       (gallery-save! (extract-form-value #"title") (extract-form-value #"code") (req-ip req)))
+     (response/full 200 #"OK" (current-seconds) #"application/json; charset=utf-8"
+                    (list (make-header #"Cache-Control" #"no-store"))
+                    (list (string->bytes/utf-8 (jsexpr->string (hasheq 'ok ok? 'msg msg)))))]
 
     ;; Gallery thumbnail: stored SVG served as an inert image (never inlined).
     [(regexp-match #px"^thumb/([0-9]{1,12})$" (req-path req))
@@ -1709,7 +1763,8 @@ ENDJS
                         "(translate dx dy cmd...)" "(scale sx sy cmd...)"
                         "(opacity a cmd...)" "(spin cx cy sec cmd...)"
                         "(pulse sec cmd...)" "(blur px cmd...)"
-                        "(glow culoare cmd...)" "(shadow dx dy px c cmd...)"))
+                        "(glow culoare cmd...)" "(shadow dx dy px c cmd...)"
+                        "(stroke c gros cmd...)" "(dash on off cmd...)"))
                ,(cheat-col "Numere"
                   (list "+  -  *  /  mod  pow" "sin cos tan atan atan2" "sqrt exp log abs sign"
                         "floor round ceil neg" "min max hypot dist" "(lerp a b t) (clamp x lo hi)"
@@ -1719,6 +1774,7 @@ ENDJS
                   (list "#rrggbb" "nume-css (red...)" "(rgb r g b)" "(rgba r g b a)"
                         "(hsl h s l)" "(hsla h s l a)" "(hsv h s v)" "(mix c1 c2 t)"
                         "(palette \"nume\" i)" "fire ocean neon pastel sunset forest"
+                        "(linear grd c1 c2 ...) ← umplere" "(radial c1 c2 ...) ← umplere"
                         "(linear-bg grd c1 c2 ...)" "(radial-bg c1 c2 ...)"))))
              ) ; /main
 
@@ -1929,4 +1985,27 @@ ENDJS
     (check-true (regexp-match? #px"/thumb/7" s))
     (check-true (regexp-match? #px"&lt;b&gt;hax" s))   ; escaped, not raw markup
     (check-false (regexp-match? #px"<b>hax</b>" s))
-    (check-true (regexp-match? #px"/\\?c=" s))))        ; open-in-editor permalink
+    (check-true (regexp-match? #px"/\\?c=" s)))        ; open-in-editor permalink
+
+  ;; --- round 7: per-shape gradients, stroke/dash ----------------------------
+  (test-case "linear/radial color builders register gradients and dedup"
+    (define a (xexpr->string (parse-to-svg "(repeat 10 (circle (* i 40) 200 30 (linear 45 \"#f00\" \"#00f\")))")))
+    (check-true (regexp-match? #px"linearGradient" a))
+    (check-true (regexp-match? #px"fill=\"url\\(#" a))
+    ;; one gradient reused for all ten identical fills
+    (check-equal? (length (regexp-match* #px"<linearGradient" a)) 1)
+    (define b (xexpr->string (parse-to-svg "(circle 1 1 1 (radial \"#fff\" \"#000\"))")))
+    (check-true (regexp-match? #px"radialGradient" b)))
+
+  (test-case "varying per-shape gradients are not wrongly deduped"
+    (define s (xexpr->string (parse-to-svg "(repeat 5 (circle (* i 40) 200 30 (radial (hsl (* i 60) 80 60) \"#000\")))")))
+    (check-equal? (length (regexp-match* #px"<radialGradient" s)) 5))
+
+  (test-case "stroke and dash wrap children via group inheritance"
+    (define s (xexpr->string (parse-to-svg "(stroke \"#fff\" 3 (circle 1 1 1 \"none\"))(dash 8 6 (line 0 0 9 9 \"red\" 2))")))
+    (check-true (regexp-match? #px"stroke=\"#fff\"" s))
+    (check-true (regexp-match? #px"stroke-dasharray=\"8,6\"" s)))
+
+  (test-case "gradient fills still obey the element/defs budget"
+    (define svg (parse-to-svg "(repeat 9000 (circle 1 1 1 (radial (hsl i 80 60) \"#000\")))"))
+    (check-true (< (count-nodes svg) 70000))))
